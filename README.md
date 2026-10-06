@@ -1,0 +1,128 @@
+# Bandshell Calendar
+
+A FastAPI web app that partially automates publishing nonprofit events to other
+organizations' online calendars. An AI agent acts as a "browser operator" through a
+one-time guided setup, then a reusable script fills the same form for every future event.
+
+**Status: demo / prototype.** All state is in-memory (a restart loses events, websites,
+scripts, and settings). Optional Google Sheets persistence and an Eventbrite API path
+exist but are lightly tested.
+
+## How it works
+
+1. **An AI agent** (LLM) uses Playwright to manually navigate to the calendar website and
+   fill in the event form — you can watch it live in the embedded browser view.
+2. **A human approves** the manual attempt in the UI (and can fix fields, solve captchas,
+   and submit from the embedded view).
+3. The agent writes a **reusable Python script** from the steps it took, parameterized by
+   the `Event` class — no LLM needed for subsequent runs.
+4. The script runs against the browser; you **review and submit manually**.
+5. Future events for that site just run the saved script.
+
+The workflow is *scripted, not automated*: nothing is ever published without a human
+looking at it.
+
+## Quick start
+
+Requires Python 3.12 with the deps in `pyproject.toml` (existing venv: `.venv`), plus:
+
+- `OPENROUTER_API_KEY` — LLM calls go to OpenRouter (model configured in `state.py`)
+- Firefox (runs `headless=False`, so a visible window appears on the server)
+
+```bash
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Then open `http://127.0.0.1:8000`, create an Event, add a Website, and run through the
+guided setup.
+
+### Optional configuration (env vars)
+
+| Variable | Effect |
+|----------|--------|
+| `OPENROUTER_FALLBACK_MODELS` | Comma-separated fallback models used when the primary is rate-limited |
+| `HEADLESS` | `1` runs the Playwright browser without a visible window (needed on headless servers) |
+| `BROWSER_FPS` | Live-view target frame rate (default `4`, max `60`). A ceiling — the actual rate is also bounded by how fast the Playwright JPEG encode runs (slow on small VMs), and unchanged frames are deduped anyway. Raise only on beefy hardware |
+| `EVENTBRITE_TOKEN` | Enables Eventbrite API websites (draft events, no publishing) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` + `EVENTS_SPREADSHEET_ID` | Google Sheets persistence (Events / Websites / Settings worksheets) |
+
+(The browser is currently hardcoded to Playwright Firefox in `browser.py`; chromium works
+with a one-line swap. On a headless server you'll want `headless=True` there.)
+
+### Serving externally
+
+The embedded live browser view uses a WebSocket (`/api/browser/{id}/ws`), so a reverse
+proxy must pass WebSocket upgrade headers. The frontend derives the WS URL from the page
+host, so any tunnel (ngrok, Cloudflare, Tailscale) works without code changes.
+
+Recommended setup: `nginx` on the server reverse-proxying to uvicorn, then an HTTPS
+tunnel (ngrok / Cloudflare tunnel) in front:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Upgrade $http_upgrade;          # WebSocket pass-through
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+```
+
+Note: ngrok tunnels WebSockets transparently. On ngrok's free tier the URL changes
+per restart — consider a static domain for anything persistent.
+
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `main.py` | FastAPI app, all `/api/*` routes, WebSocket live view |
+| `agents.py` | Agent orchestration state machines (`run_onboarding`, `run_task`) |
+| `bot.py` | LLM client (OpenRouter/OpenAI-compatible) with tool-call loop + retry/fallback handling |
+| `browser.py` | Playwright manager + the browser tools the agent calls |
+| `scripting.py` | Script validation (AST allowlist) and in-process execution (`Driver`) |
+| `scripter.py` | Prompt builders + code-extraction helpers |
+| `event.py` `settings.py` `website.py` `task.py` | Dataclasses |
+| `eventbrite_api.py` | Eventbrite API client (drafts, image upload) |
+| `storage.py` `drive.py` `memory_storage.py` | Persistence facade (Google Sheets optional) |
+| `serialization.py` | Dataclass ↔ API-dict conversion, settings-version hashing |
+| `frontend/` | Static UI (`index.html`, `app.js`, `style.css`) |
+| `logs/` | Runtime LLM usage + per-run transcripts (JSONL, gitignored) |
+
+## Key behavior notes
+
+- **Scripts are gated by `validate_script()`** — an AST walk that rejects imports,
+  disallowed calls, and dangerous patterns before any script executes. This is the defense
+  against prompt/code injection (a malicious calendar site steering the agent toward
+  malicious code). Future: run scripts in a sandboxed subprocess; the tight `Driver` API is
+  designed so that swap is confined to the execution layer.
+- **Settings versioning:** generated scripts record a hash of the *global* settings they
+  were built against (venue, location, cost, categories, timezone, Eventbrite IDs). Changing
+  those marks a scripted website **stale** and it must be re-onboarded — scripts take those
+  defaults for granted. Per-event fields (website_url, organizer, contact info) don't
+  invalidate scripts; each event carries its own copy.
+- **Image URLs:** Google Drive share links are rewritten to direct-download URLs before the
+  agent or script uses them. A link that isn't shared ("Anyone with the link") is caught by a
+  preflight check and logs a clear warning instead of failing opaquely.
+- **The embedded view is a stream of JPEG screenshots** (rate = `BROWSER_FPS`, default 4fps
+  over a WebSocket), not a real iframe. It's view-only while the AI works, interactive during
+  approval/review phases.
+  Because it's imagery, text in the page can't be copied from it — but you can paste *into*
+  it with Ctrl/Cmd+V (reads your OS clipboard, inserts into the focused field).
+- **The agent's browser window closes** when its interaction finishes; a website left
+  mid-onboarding by a crash/restart is reset to *Not set up* at startup rather than stuck
+  waiting to approve.
+
+## Monitoring
+
+- `logs/llm_usage.jsonl` — one line per LLM call: model, finish reason, token counts,
+  elapsed, failed attempts. Watch for `"finish": "length"` (the 8192-token runaway guard
+  cut a response short).
+- `logs/onboarding_*.jsonl` / `logs/task_*.jsonl` — full per-run transcripts (tool calls +
+  results included).
+
+See `AGENTS.md` for the in-depth agent-oriented guide to the codebase.

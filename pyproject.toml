@@ -1,0 +1,15 @@
+[project]
+name = "bandshell-calendar"
+version = "0.1.0"
+description = "AI-assisted workflow for publishing nonprofit events to other organizations' online calendars"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.141.1",
+    "fastmcp>=3.4.4",
+    "gspread>=6.2.1",
+    "mcp[cli]>=1.28.1",
+    "playwright>=1.61.0",
+    "requests>=2.34.2",
+    "uvicorn>=0.51.0",
+]

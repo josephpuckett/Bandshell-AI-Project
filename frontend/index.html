@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bandshell Calendar Demo</title>
+    <link rel="stylesheet" href="{{style_url}}">
+</head>
+
+<body>
+    <header class="app-header">
+        <div class="brand">
+            <span class="logo">🎪</span>
+            <div>
+                <h1>Bandshell Calendar</h1>
+                <p class="tagline">Publish events to calendars with AI assistance</p>
+            </div>
+        </div>
+        <div class="header-groups">
+            <div class="view-switch">
+                <button id="viewEventsBtn" class="btn view active">Events</button>
+                <button id="viewWebsitesBtn" class="btn view">Websites</button>
+            </div>
+            <div class="header-actions">
+                <button id="refreshBtn" class="btn" title="Reload data from the Google Sheet">↻ Refresh</button>
+                <button id="newEventBtn" class="btn primary">+ New Event</button>
+                <button id="newWebsiteBtn" class="btn">+ Website</button>
+                <button id="settingsBtn" class="btn">⚙️ Settings</button>
+                <button id="helpBtn" class="btn help-btn" title="How to use this app">?</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- ============================ EVENTS VIEW ============================ -->
+    <div id="eventsView">
+        <main class="layout">
+
+            <!-- Events list -->
+            <section class="panel events-panel">
+                <div class="panel-head">
+                    <h2>Events</h2>
+                    <span id="eventCount" class="count"></span>
+                </div>
+                <div id="eventsList" class="list"></div>
+                <p id="emptyEvents" class="muted">No events yet. Click <b>+ New Event</b> to create your first.</p>
+            </section>
+
+            <!-- Event detail -->
+            <section class="panel event-panel" id="eventPanel" hidden>
+                <div class="panel-head">
+                    <h2 id="eventTitle"></h2>
+                    <span id="eventDates" class="muted"></span>
+                    <button class="btn" id="eventEditBtn">✏️ Edit</button>
+                </div>
+                <div id="eventDetail" class="detail"></div>
+            </section>
+
+        </main>
+    </div>
+
+    <!-- ============================ WEBSITES VIEW ============================ -->
+    <div id="websitesView" hidden>
+        <main class="layout">
+
+            <!-- Websites list -->
+            <section class="panel">
+                <div class="panel-head">
+                    <h2>Websites</h2>
+                    <span id="websiteCount" class="count"></span>
+                </div>
+                <p class="muted">Set up a website once, and every event you add to it keeps the same setup. Adding an <b>Eventbrite</b> site sends events straight to Eventbrite.</p>
+                <div class="legend">
+                    <span class="lg-item"><span class="badge unscripted">Not set up</span> needs one-time setup</span>
+                    <span class="lg-item"><span class="badge scripting">Setting up</span> AI is working now</span>
+                    <span class="lg-item"><span class="badge scripted">Ready</span> works &amp; reusable</span>
+                    <span class="lg-item"><span class="badge error">Needs attention</span> something went wrong</span>
+                    <span class="lg-item"><span class="badge stale">Stale</span> re-setup after settings change</span>
+                </div>
+                <div id="websitesList" class="list"></div>
+                <p id="emptyWebsites" class="muted">No websites yet. Click <b>+ Website</b> to add a place your events can go (e.g. an Eventbrite page or an org's calendar form).</p>
+            </section>
+
+            <!-- Website detail -->
+            <section class="panel website-panel" id="websitePanel" hidden>
+                <div class="panel-head">
+                    <h2 id="wsName"></h2>
+                    <div class="row gap">
+                        <span id="wsStatus" class="badge"></span>
+                        <span id="wsPhase" class="badge"></span>
+                    </div>
+                    <button class="btn" id="wsEditBtn">✏️ Edit</button>
+                </div>
+                <div class="task-url" id="wsUrl"></div>
+                <p class="muted" id="wsStatusLine"></p>
+                <p id="wsStale" class="muted stale" hidden>
+                    Settings have changed since this script was generated — re-onboard to update it.
+                </p>
+
+                <h3>Actions</h3>
+                <div id="wsActions" class="actions"></div>
+
+                <div id="browserPanel" class="browser-panel" hidden>
+                    <h3>Live page</h3>
+                    <p class="muted" id="browserHint">Live browser preview appears here while the AI works — you can watch and, when it's your turn, click &amp; type to fix, solve captchas, and submit.</p>
+                    <div class="browser-stage" id="browserStage" tabindex="0">
+                        <img id="browserFrame" alt="Live browser preview">
+                        <p id="browserPlaceholder" class="muted" hidden>Waiting for a live page…</p>
+                    </div>
+                    <div class="row gap">
+                        <button class="btn primary off" id="browserDoneBtn">✓ Done — I've reviewed/submitted</button>
+                    </div>
+                </div>
+
+                <p id="wsEventbriteNote" class="muted" hidden>
+                    This is an <b>Eventbrite</b> website. Adding an event creates a <b>draft</b>
+                    on Eventbrite via the API; publish it there manually after reviewing.
+                </p>
+
+                <h3 id="wsScriptsHead">Saved routine</h3>
+                <div id="wsScripts" class="list"></div>
+
+                <h3 id="wsLogHead">Activity</h3>
+                <div id="wsLog" class="log"></div>
+            </section>
+        </main>
+    </div>
+
+    <!-- ============================ DIALOGS ============================ -->
+
+    <!-- New event dialog (also used for editing) -->
+    <dialog id="eventModal">
+        <form id="eventForm">
+            <h2 id="eventModalTitle">New Event</h2>
+            <p class="muted wide" id="eventModalNote">
+                Only fields that vary per event are shown here. Categories and other
+                defaults come from <strong>⚙️ Settings</strong>.
+            </p>
+
+            <label class="wide"><span class="inrow">Title
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The name of the event, e.g. <b>Summer Concert in the Park</b>.</span></span>
+                </span><input type="text" name="title" required></label>
+            <label class="wide"><span class="inrow">Short Summary
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">A quick line shown in lists or previews.</span></span>
+                </span><textarea name="short_summary" rows="2" required></textarea></label>
+            <label class="wide"><span class="inrow">Long Summary
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The full description people read before deciding to attend.</span></span>
+                </span><textarea name="long_summary" rows="3" required></textarea></label>
+            <label class="wide"><span class="inrow">Image URL
+                    <span class="tip" tabindex="0">
+                        <span class="tip-q">?</span>
+                        <span class="tip-box">
+                            <strong>How to get the image URL</strong><br>
+                            <b>Direct link</b> (ends in .jpg/.png/.gif/.webp — or the URL points straight at an image file):
+                            copy-paste it here as-is.<br><br>
+                            <b>Google Drive link</b> (<span class="tip-code">drive.google.com/...</span>): open the file →
+                            <b>File ▸ Share ▸ Copy link</b>, then paste it. The application will automatically handle it.
+                        </span>
+                    </span>
+                </span><input type="url" name="image" required></label>
+            <label><span class="inrow">Start Date
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">When the event starts.</span></span>
+                </span><input type="datetime-local" name="start_date" required></label>
+            <label><span class="inrow">End Date
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">When the event ends.</span></span>
+                </span><input type="datetime-local" name="end_date" required></label>
+
+            <div class="divider">Organizer &amp; website — defaults come from ⚙️ Settings, change them per event if needed</div>
+            <label class="wide"><span class="inrow">Website URL
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The event's own website. Blank = use the default from Settings.</span></span>
+                </span><input type="url" name="website_url" placeholder="https://... (defaults to Settings)"></label>
+            <label class="wide"><span class="inrow">Organizer
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The group or person putting on this event. Blank = use the default from Settings.</span></span>
+                </span><input type="text" name="organizer" placeholder="Defaults to Settings"></label>
+            <label>Organizer First Name <input type="text" name="organizer_first_name" placeholder="Defaults to Settings"></label>
+            <label>Organizer Last Name <input type="text" name="organizer_last_name" placeholder="Defaults to Settings"></label>
+            <label>Organizer Phone <input type="tel" name="organizer_phone_number" placeholder="Defaults to Settings"></label>
+            <label>Organizer Email <input type="email" name="organizer_email_address" placeholder="Defaults to Settings"></label>
+
+            <div class="modal-actions">
+                <button type="button" id="closeEventModal" class="btn">Cancel</button>
+                <button type="submit" id="eventModalSubmit" class="btn primary">Create Event</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- New website dialog (also used for editing) -->
+    <dialog id="websiteModal">
+        <form id="websiteForm">
+            <h2 id="websiteModalTitle">New Website</h2>
+            <p class="muted wide" id="websiteModalNote">Add a site once and the AI figures it out, so every future event is added to it the same way. <b>Eventbrite</b> sites send events straight to Eventbrite instead.</p>
+            <label class="wide">Kind
+                <select name="kind" id="websiteKind">
+                    <option value="agentic">AI-assisted (an AI fills the site's form)</option>
+                    <option value="eventbrite">Eventbrite (sends events straight to Eventbrite)</option>
+                </select>
+            </label>
+            <label class="wide"><span class="inrow">Name
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">A label so you recognize the site, e.g. <b>Arts Council Calendar</b>.</span></span>
+                </span><input type="text" name="name" placeholder="e.g. Arts Council for Long Beach"></label>
+            <label class="wide"><span class="inrow">URL
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The address where events get added. For Eventbrite you can leave this blank.</span></span>
+                </span><input type="url" name="url" placeholder="https://..." required></label>
+
+            <div class="modal-actions">
+                <button type="button" id="closeWebsiteModal" class="btn">Cancel</button>
+                <button type="submit" id="websiteModalSubmit" class="btn primary">Create Website</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- Eventbrite venue/organizer config dialog -->
+    <dialog id="ebConfigModal">
+        <form id="ebConfigForm">
+            <h2>Configure Eventbrite venue &amp; organizer</h2>
+            <p class="muted wide">Fill these once — the app reuses them for every event it sends to Eventbrite. Find these IDs in your Eventbrite account.</p>
+            <label class="wide"><span class="inrow">Venue ID
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The ID of the venue where events happen, from your Eventbrite account.</span></span>
+                </span><input type="text" id="ebVenueId" placeholder="Eventbrite venue id"></label>
+            <label class="wide"><span class="inrow">Organizer ID
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The ID of the organizer who runs the events, from your Eventbrite account.</span></span>
+                </span><input type="text" id="ebOrgId" placeholder="Eventbrite organizer id"></label>
+
+            <div class="modal-actions">
+                <button type="button" id="closeEbConfigModal" class="btn">Cancel</button>
+                <button type="submit" class="btn primary">Save venue/organizer</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- Settings dialog -->
+    <dialog id="settingsModal">
+        <form id="settingsForm">
+            <h2>Settings</h2>
+            <p class="muted wide">
+                Global defaults applied to every new event. <b>Venue, location, cost,
+                categories and publicity</b> are baked into every event. The
+                <b>website &amp; organizer</b> fields are <i>prefill defaults</i> — each
+                event can override them, but for most events these values are used as-is.
+            </p>
+
+            <label class="wide"><span class="inrow">Venue
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The place events happen. Used on every event — change it only if it changes for real.</span></span>
+                </span><input type="text" name="venue"></label>
+            <label class="wide"><span class="inrow">Location
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The street address. Same idea — it's used on every event.</span></span>
+                </span><input type="text" name="location"></label>
+            <label class="check">
+                <input type="checkbox" name="open_to_public" checked>
+                Open to public (on by default)
+            </label>
+            <label><span class="inrow">Event Cost
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">Events are free, so this normally stays at 0.</span></span>
+                </span><input type="number" name="event_cost" min="0" step="0.01" value="0"></label>
+            <label class="wide">Website URL <input type="url" name="website_url" placeholder="Prefill used for new events"></label>
+            <label class="wide"><span class="inrow">Organizer
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">The group or person putting on the events. Prefilled into new events; each event can override it.</span></span>
+                </span><input type="text" name="organizer" placeholder="Prefill used for new events"></label>
+            <label>Organizer First Name <input type="text" name="organizer_first_name" placeholder="Prefill"></label>
+            <label>Organizer Last Name <input type="text" name="organizer_last_name" placeholder="Prefill"></label>
+            <label>Organizer Phone <input type="tel" name="organizer_phone_number" placeholder="Prefill"></label>
+            <label>Organizer Email <input type="email" name="organizer_email_address" placeholder="Prefill"></label>
+            <label class="wide"><span class="inrow">Categories
+                    <span class="tip" tabindex="0"><span class="tip-q">?</span><span class="tip-box">How events are sorted/filtered, e.g. Music, Family, Outdoor.</span></span>
+                </span><input type="text" name="categories" placeholder="Comma separated, e.g. Music, Family, Outdoor">
+            </label>
+
+            <div class="divider">Eventbrite (most people can leave these alone)</div>
+            <label class="wide">Timezone
+                <input type="text" name="timezone" placeholder="America/Los_Angeles">
+            </label>
+            <label class="wide">Eventbrite Organization ID
+                <input type="text" name="eventbrite_organization_id" placeholder="Optional; auto-resolved from token if empty">
+            </label>
+            <label class="wide">Eventbrite Category IDs
+                <input type="text" name="eventbrite_categories" placeholder="Music=103, Family=107 (our category = Eventbrite id)">
+            </label>
+
+            <div class="modal-actions">
+                <button type="button" id="closeSettingsModal" class="btn">Cancel</button>
+                <button type="submit" class="btn primary">Save Settings</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- How-to-use help dialog -->
+    <dialog id="helpModal">
+        <div class="help-wrap">
+            <h2>How to use this app</h2>
+            <ol class="help-steps">
+                <li><b>Create an event.</b> Click <b>+ New Event</b> and fill in the details (title, dates, description, image). The everyday info like venue and organizer comes from <b>⚙️ Settings</b>.</li>
+                <li><b>Add a website.</b> Click <b>+ Website</b> to tell the app where events should go — e.g. an Eventbrite page or another organization's calendar form. You do this once per website.</li>
+                <li><b>Set each website up (one time).</b> Open a website and click <b>Set up this website</b>. An AI fills the site's form in a browser window. Watch it, check the result, then <b>Approve</b> (or <b>Reject</b> with a note so it can fix it).</li>
+                <li><b>Review and submit.</b> The AI saves a routine for that website. From then on, adding an event to it runs the saved routine — you review the filled form in the browser and submit it yourself. <b>Eventbrite</b> sites send events straight to Eventbrite as drafts for you to publish.</li>
+            </ol>
+            <p class="muted"><b>Tip:</b> hovering over the <b>?</b> markers next to fields explains what each field does.</p>
+            <div class="modal-actions">
+                <button type="button" id="closeHelpModal" class="btn primary">Got it</button>
+            </div>
+        </div>
+    </dialog>
+
+    <script src="{{app_url}}"></script>
+</body>
+
+</html>
