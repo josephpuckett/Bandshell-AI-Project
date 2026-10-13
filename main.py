@@ -23,8 +23,9 @@ from event import Event
 from serialization import (asset_url, current_settings_version, event_out,
                            task_out, website_out, _parse_event_id)
 from settings import Settings
-from state import (BROWSER_FPS, FRONTEND, events, input_queues, runners, settings,
-                   tasks, website_queues, website_runners, websites)
+from state import (BROWSER_FPS, BROWSER_JPEG_QUALITY, FRONTEND, events,
+                   input_queues, runners, settings, tasks, website_queues,
+                   website_runners, websites)
 from storage import storage
 from task import Task
 from scripting import run_script_against_event
@@ -645,10 +646,10 @@ async def add_event_eventbrite(website_id: UUID, payload: dict):
 
 # ------------------------- Embedded browser view -----------------------------
 # Streams a live screenshot of the website's open browser page over WebSocket
-# (configurable frame rate, default ~4fps — see state.BROWSER_FPS), and proxies
-# the human's edits/clicks/keys back into the real Playwright page — but only
-# while the human is expected to interact (approval phases, or a scripted run's
-# review page). Otherwise it is view-only.
+# (rate/quality configurable via state.BROWSER_FPS / state.BROWSER_JPEG_QUALITY),
+# and proxies the human's edits/clicks/keys back into the real Playwright page —
+# but only while the human is expected to interact (approval phases, or a
+# scripted run's review page). Otherwise it is view-only.
 
 HUMAN_INTERACT_PHASES = {'manual_approval', 'script_approval'}
 
@@ -763,7 +764,7 @@ async def _handle_view_event(website_id: UUID, raw: str):
 
 @app.websocket('/api/browser/{website_id}/ws')
 async def browser_stream(websocket: WebSocket, website_id: str):
-    """Stream the live page as JPEG frames (rate = state.BROWSER_FPS); accept human edit events."""
+    """Stream the live page as JPEG frames (state.BROWSER_FPS / QUALITY); accept human edit events."""
     try:
         wid = UUID(website_id)
     except ValueError:
@@ -800,7 +801,7 @@ async def browser_stream(websocket: WebSocket, website_id: str):
                 last_frame = None
                 continue
             try:
-                frame = await page.screenshot(type='jpeg', quality=80)
+                frame = await page.screenshot(type='jpeg', quality=BROWSER_JPEG_QUALITY)
                 vw, vh = page.viewport_size or (0, 0)
             except Exception:
                 # Page closed under us (e.g. a run was finished/cancelled).

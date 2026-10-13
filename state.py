@@ -40,6 +40,12 @@ EVENTBRITE_TOKEN = os.getenv("EVENTBRITE_TOKEN") or ""
 BROWSER_FPS = float(os.getenv("BROWSER_FPS", "4") or 4.0)
 BROWSER_FPS = min(max(BROWSER_FPS, 1.0), 60.0)
 
+# JPEG quality for live-view frames. Lower = faster encode + smaller frames
+# (the encode is the CPU floor on small VMs), at a small visual cost. 70–80 is
+# a good watching balance; 50–60 for constrained hardware.
+BROWSER_JPEG_QUALITY = int(os.getenv("BROWSER_JPEG_QUALITY", "80") or 80)
+BROWSER_JPEG_QUALITY = min(max(BROWSER_JPEG_QUALITY, 30), 95)
+
 # --- The mounted browser MCP agent (Bot drives Playwright through this) ---
 parent = FastMCP("parent")
 parent.mount(browser_mcp)

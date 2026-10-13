@@ -43,6 +43,7 @@ guided setup.
 | `OPENROUTER_FALLBACK_MODELS` | Comma-separated fallback models used when the primary is rate-limited |
 | `HEADLESS` | `1` runs the Playwright browser without a visible window (needed on headless servers) |
 | `BROWSER_FPS` | Live-view target frame rate (default `4`, max `60`). A ceiling — the actual rate is also bounded by how fast the Playwright JPEG encode runs (slow on small VMs), and unchanged frames are deduped anyway. Raise only on beefy hardware |
+| `BROWSER_JPEG_QUALITY` | Live-view JPEG quality (default `80`, range 30–95). Lower = faster encode + smaller frames (the encode is the CPU floor on small VMs); a small visual cost in the watching view |
 | `EVENTBRITE_TOKEN` | Enables Eventbrite API websites (draft events, no publishing) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` + `EVENTS_SPREADSHEET_ID` | Google Sheets persistence (Events / Websites / Settings worksheets) |
 

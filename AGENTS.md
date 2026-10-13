@@ -222,9 +222,11 @@ main.py       <- depends on everything; imports agents/serialization/state
   Playwright page over a WebSocket (`/api/browser/{id}/ws`). The target rate is configured
   by `BROWSER_FPS` (default 4) — but it's a *ceiling*: each frame is a CPU-bound JPEG
   encode in the browser process, so on loaded/small VMs the encode time (not the setting)
-  determines the real rate. The event poll is kept a fraction of the frame budget so it
-  never gates frame production. Unchanged frames are deduped
-  (a quiet page just gets a lightweight `ping` heartbeat, so bandwidth stays low). It is
+  determines the real rate. `BROWSER_JPEG_QUALITY` (default 80) trades encode speed/frame
+  size against sharpness — drop it on constrained hardware. The event poll is kept a
+  fraction of the frame budget so it never gates frame production. Unchanged frames are
+  deduped (a quiet page just gets a lightweight `ping` heartbeat, so bandwidth stays low).
+  The stream logs achieved fps every ~2s (`[browser-ws] ... ~X.Xfps sent`). It is
   **view-only** while the AI is working (manual_fill/writing/running) and becomes
   **interactive** during approval phases and scripted-run review: clicks/types/scroll are
   proxied back into the real page (`page.mouse`/`keyboard`) so the human can fix fields,
