@@ -880,14 +880,22 @@ async def browser_stream(websocket: WebSocket, website_id: str):
     cdp_page = None       # page identity the CDP session is attached to
     try:
         while True:
-            # Drain queued human events promptly (so clicks feel immediate), but
-            # with a timeout short enough to stay ahead of the frame schedule.
-            drained = await _drain_view_events(websocket, wid, timeout=event_poll)
-            if drained:
-                continue  # handle the next batch immediately
+            # Process a BOUNDED batch of human events so a flood (continuous
+            # scroll/typing) can't starve frame production — events interleave
+            # with frames instead of blocking them entirely (the old unbounded
+            # drain + `drained: continue` froze the view until input stopped).
+            _handled, clicked = await _drain_view_events(
+                websocket, wid, timeout=event_poll, max_events=16)
+            if clicked:
+                # Make menu clicks visible immediately: skip the fps gate this
+                # iteration so the freshest frame is sent right away.
+                next_frame_at = 0.0
+                await _hint_native_control(wid, websocket)
             tick = asyncio.get_running_loop().time()
             if tick < next_frame_at:
-                await asyncio.sleep(next_frame_at - tick)
+                # Small bounded sleep: keeps the frame clock honest while still
+                # polling events promptly (so the post-click frame appears fast).
+                await asyncio.sleep(min(0.02, next_frame_at - tick))
                 continue
             next_frame_at = tick + frame_interval
             w = websites.get(wid)
@@ -973,19 +981,70 @@ async def browser_stream(websocket: WebSocket, website_id: str):
             cdp, cdp_page = None, None
 
 
-async def _drain_view_events(websocket: WebSocket, wid: UUID, timeout: float = 0.05) -> bool:
-    """Handle queued human events; return True if at least one was processed."""
+async def _drain_view_events(websocket: WebSocket, wid: UUID, timeout: float = 0.05,
+                             max_events: int = 0) -> tuple[bool, bool]:
+    """Handle queued human events; return (handled_any, handled_click).
+
+    Processes at most `max_events` events (0 = unlimited) so a flood of scroll
+    events can't monopolize the loop and starve frame production. Clicks are
+    flagged so the caller can flush a frame immediately after them.
+    """
     saw = False
+    saw_click = False
+    count = 0
     while True:
+        if max_events and count >= max_events:
+            break
         try:
             raw = await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+            if isinstance(raw, str):
+                try:
+                    ev = json.loads(raw)
+                    if isinstance(ev, dict) and ev.get('type') == 'click':
+                        saw_click = True
+                except Exception:
+                    pass
             await _handle_view_event(wid, raw)
             saw = True
+            count += 1
         except asyncio.TimeoutError:
             break
         except (WebSocketDisconnect, RuntimeError):
             raise
-    return saw
+    return saw, saw_click
+
+
+async def _hint_native_control(wid: UUID, websocket: WebSocket):
+    """Tell the client when the focused element is a native control whose popup
+    can't appear in the stream.
+
+    Native Chromium date pickers and <select> dropdowns are rendered as browser
+    chrome popups, NOT page content — CDP screencast (and page.screenshot) can't
+    capture them. After a click lands on one, push a hint so the human knows to
+    type/use the keyboard instead of waiting for a popup that will never show.
+    Best-effort; never raises.
+    """
+    try:
+        page = await _resolve_live_page(wid)
+        if page is None:
+            return
+        info = await page.evaluate("""() => {
+            const el = document.activeElement;
+            if (!el) return null;
+            const tag = (el.tagName || '').toLowerCase();
+            const type = el.type ? String(el.type).toLowerCase() : '';
+            if (tag === 'select') return 'select';
+            if (tag === 'input' && type === 'date') return 'date';
+            return null;
+        }""")
+        if info == 'select':
+            await websocket.send_json({'type': 'hint',
+                'text': "Native dropdown\u2019t render in the live view — use ArrowDown/Up + Enter to pick an option."})
+        elif info == 'date':
+            await websocket.send_json({'type': 'hint',
+                'text': "Native date picker doesn\u2019t show in the live view — click the field and type the date (e.g. 12/25/2026), then Enter."})
+    except Exception:
+        pass
 
 
 # Static assets (style.css, app.js) are served from /static so they can

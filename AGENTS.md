@@ -227,7 +227,9 @@ main.py       <- depends on everything; imports agents/serialization/state
   `page.screenshot()`). The target rate is configured by `BROWSER_FPS` (default 4) — a
   *ceiling*. `BROWSER_JPEG_QUALITY` (default 80) trades encode speed/frame size against
   sharpness — drop it on constrained hardware. The event poll is kept a fraction of the frame
-  budget so it never gates frame production. Unchanged frames are deduped (a quiet page just
+  budget so it never gates frame production (event batches are capped so a scroll/typing
+  flood can't starve frames — the view keeps streaming while you scroll, and clicks flush
+  a frame immediately). Unchanged frames are deduped (a quiet page just
   gets a lightweight `ping` heartbeat, so bandwidth stays low).
   The stream logs achieved fps every ~2s (`[browser-ws] ... ~X.Xfps sent`). It is
   **view-only** while the AI is working (manual_fill/writing/running) and becomes
@@ -238,10 +240,14 @@ main.py       <- depends on everything; imports agents/serialization/state
   view shows the real run rather than a stale fallback. Scroll events include the cursor
   coordinates and the server moves the pointer there first, so wheeling scrolls where the
   user is looking. Scroll works even while the AI is working (view-only panning):
-  the client sends wheel deltas normalized to pixel units (~120px per notch), and
+  the client coalesces wheel deltas (~50ms flush, so continuous scrolling sends one
+  accumulated scroll per tick instead of a flood), and
   the server dispatches a *native* `mouse.wheel` at the pointer (falling back to a
   DOM scrollable-ancestor walk) — native wheel scrolls whatever is under the cursor,
   including content inside iframes, which a JS elementFromPoint walk can't reach.
+  Native browser popups (date pickers, select dropdowns) are browser-chrome and CANNOT
+  appear in the captured stream — after a click lands on one, the server pushes a `hint`
+  message telling the human to type/use the keyboard instead.
   Click coordinates are remapped from the image's *intrinsic* pixel
   size (`naturalWidth/Height`), so they stay exact even if the reported viewport
   disagrees (DPI/zoom). **Paste:** Ctrl/Cmd+V (or Edit ▸ Paste) while interactive reads the

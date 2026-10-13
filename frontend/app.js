@@ -253,6 +253,8 @@ async function openWebsite(id) {
 let browserWs = null;
 let browserStreamingWid = null;
 let browserVW = 0, browserVH = 0; // live page viewport size (natural frame dims)
+let browserHintOverride = "";   // transient hint text (native-picker tip) shown in place of defaults
+let pendingScroll = null;        // coalesced wheel deltas waiting to flush
 
 function browserWsUrl(id) {
     const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -285,8 +287,15 @@ function openBrowserStream(id) {
             ph.hidden = true;
             stage.classList.remove("placeholder");
             setBrowserInteractive(int, phase);
+        } else if (msg.type === "hint") {
+            // Server-side tip: the focused control's popup can't be captured
+            // (native date pickers / select dropdowns). Show it in the hint
+            // bar; it sticks until the next frame/ping refreshes interactive state.
+            browserHintOverride = msg.text || "";
+            document.getElementById("browserHint").textContent = browserHintOverride;
         } else if (msg.type === "empty") {
             browserVW = 0; browserVH = 0;
+            browserHintOverride = "";
             frame.removeAttribute("src");
             ph.hidden = false;
             ph.textContent = "No live page right now — it appears after onboarding starts or a script runs.";
@@ -321,6 +330,7 @@ function openBrowserStream(id) {
 
 function closeBrowserStream() {
     browserStreamingWid = null;
+    browserHintOverride = "";
     if (browserWs) { try { browserWs.close(); } catch (_) { } browserWs = null; }
     document.getElementById("browserFrame").removeAttribute("src");
     const ph = document.getElementById("browserPlaceholder");
@@ -334,7 +344,11 @@ function setBrowserInteractive(v, phase) {
     browserInteractive = v;
     const hint = document.getElementById("browserHint");
     const done = document.getElementById("browserDoneBtn");
-    if (v) {
+    // A server-pushed hint (native picker tip) wins over the boilerplate text;
+    // it stays until the next interactive-state change clears it.
+    if (browserHintOverride && v) {
+        hint.textContent = browserHintOverride;
+    } else if (v) {
         hint.innerHTML = "It's your turn — click &amp; type to fix (Ctrl/Cmd+V pastes from your "
             + "clipboard), then <b>submit the form here</b>.";
         // During onboarding's approval phases the human uses Approve/Reject in
@@ -400,8 +414,20 @@ function browserCoord(e) {
         const rawDx = e.deltaX || 0, rawDy = e.deltaY || 0;
         const notch = Math.abs(rawDy) < 20 && Math.abs(rawDy) > 0 ? rawDy * 40 : rawDy;
         const notchX = Math.abs(rawDx) < 20 && Math.abs(rawDx) > 0 ? rawDx * 40 : rawDx;
-        browserSend({ type: "scroll", x, y,
-                      dx: Math.round(notchX), dy: Math.round(notch) });
+        // Coalesce continuous scrolling: track pending deltas and flush at most
+        // one scroll event per ~50ms. Wheel fires at framerate, so sending every
+        // event would flood the WS and starve the frame stream; deltas still add
+        // up correctly because we accumulate between flushes.
+        if (!pendingScroll) pendingScroll = { x: 0, y: 0, dx: 0, dy: 0 };
+        pendingScroll.x = x; pendingScroll.y = y;
+        pendingScroll.dx += Math.round(notchX);
+        pendingScroll.dy += Math.round(notch);
+        if (!pendingScroll.timer) {
+            pendingScroll.timer = setTimeout(() => {
+                const s = pendingScroll; pendingScroll = null;
+                if (s.dx || s.dy) browserSend({ type: "scroll", x: s.x, y: s.y, dx: s.dx, dy: s.dy });
+            }, 50);
+        }
     }, { passive: false });
     stage.addEventListener("keydown", (e) => {
         // Ctrl/Cmd+V over the live page → paste OS clipboard into the focused
