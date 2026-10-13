@@ -762,9 +762,104 @@ async def _handle_view_event(website_id: UUID, raw: str):
         pass  # page closed mid-click; the stream shows 'empty' next tick
 
 
+async def _start_screencast(page):
+    """Start Chromium's CDP screencast pipeline for a page.
+
+    Returns (cdp_session, frames_queue) on success, or None when CDP isn't
+    available (Firefox/WebKit) so the caller falls back to page.screenshot().
+    The queue holds the single most recent frame dict ({"data": base64 jpeg,
+    "sessionId": ..., "metadata": {...}}) — each received frame is acked
+    immediately (Chromium stops streaming otherwise) and the loop sends the
+    latest one per its fps ceiling, dropping in-between frames for free.
+    """
+    try:
+        session = await page.context.new_cdp_session(page)
+    except Exception:
+        return None  # CDP sessions are Chromium-only
+    frames: asyncio.Queue = asyncio.Queue(maxsize=1)
+
+    def on_frame(params: dict):
+        # Chromium requires every screencast frame to be acknowledged or it
+        # stops emitting new ones.
+        sid = (params or {}).get('sessionId')
+        if sid:
+            try:
+                asyncio.get_running_loop().create_task(
+                    session.send('Page.screencastFrameAck', {'sessionId': sid}))
+            except Exception:
+                pass
+        try:
+            if frames.full():
+                frames.get_nowait()  # drop stale frame, keep the freshest
+            frames.put_nowait(params)
+        except Exception:
+            pass
+
+    session.on('Page.screencastFrame', on_frame)
+
+    def on_close(*_a):
+        # Page/context died: let the main loop see an empty queue so it
+        # re-attaches (or falls back) next tick instead of sending dead frames.
+        try:
+            while not frames.empty():
+                frames.get_nowait()
+        except Exception:
+            pass
+
+    session.on('close', on_close)
+    try:
+        vp = page.viewport_size or {'width': 1280, 'height': 850}
+        await session.send('Page.startScreencast', {
+            'format': 'jpeg',
+            'quality': BROWSER_JPEG_QUALITY,
+            'everyNthFrame': 1,
+            'maxWidth': vp.get('width'),
+            'maxHeight': vp.get('height'),
+        })
+    except Exception:
+        try:
+            await session.detach()
+        except Exception:
+            pass
+        return None
+    return session, frames
+
+
+async def _stop_screencast(cdp):
+    """Idempotently stop + detach a CDP screencast session (or None)."""
+    if not cdp:
+        return
+    session, _frames = cdp
+    try:
+        await session.send('Page.stopScreencast')
+    except Exception:
+        pass
+    try:
+        await session.detach()
+    except Exception:
+        pass
+
+
+def _log_sent_fps(wid, frames_sent, fps_logged_at):
+    """Count a sent frame; log achieved fps every ~2s. Returns (frames_sent, fps_logged_at)."""
+    frames_sent += 1
+    now = asyncio.get_running_loop().time()
+    if now - fps_logged_at >= 2.0:
+        fps = frames_sent / max(now - fps_logged_at, 1e-6)
+        print(f'[browser-ws] {wid} ~{fps:.1f}fps sent (BROWSER_FPS={BROWSER_FPS:g})')
+        frames_sent = 0
+        fps_logged_at = now
+    return frames_sent, fps_logged_at
+
+
 @app.websocket('/api/browser/{website_id}/ws')
 async def browser_stream(websocket: WebSocket, website_id: str):
-    """Stream the live page as JPEG frames (state.BROWSER_FPS / QUALITY); accept human edit events."""
+    """Stream the live page as JPEG frames (state.BROWSER_FPS / QUALITY); accept human edit events.
+
+    Uses Chromium's CDP screencast pipeline when the browser is Chromium (high
+    fps at low CPU — no per-frame re-capture), and falls back to
+    page.screenshot() for Firefox/WebKit.
+    """
     try:
         wid = UUID(website_id)
     except ValueError:
@@ -781,6 +876,8 @@ async def browser_stream(websocket: WebSocket, website_id: str):
     event_poll = min(0.05, frame_interval / 2)
     frames_sent = 0
     fps_logged_at = 0.0
+    cdp = None            # (session, frames_queue) when streaming via CDP
+    cdp_page = None       # page identity the CDP session is attached to
     try:
         while True:
             # Drain queued human events promptly (so clicks feel immediate), but
@@ -796,9 +893,49 @@ async def browser_stream(websocket: WebSocket, website_id: str):
             w = websites.get(wid)
             page = await _resolve_live_page(wid)
             if page is None:
+                if cdp is not None:
+                    await _stop_screencast(cdp)
+                    cdp, cdp_page = None, None
                 await websocket.send_json({'type': 'empty', 'interactive': False,
                                            'phase': w.phase if w else ''})
                 last_frame = None
+                continue
+            # (Re)attach the CDP screencast when the visible page changes.
+            if cdp_page is not page:
+                if cdp is not None:
+                    await _stop_screencast(cdp)
+                cdp = await _start_screencast(page)
+                cdp_page = page  # remember even if None (avoid retry every tick)
+            if cdp is not None:
+                # CDP screencast: send the freshest frame if we have one.
+                params = None
+                try:
+                    params = cdp[1].get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                if params is not None:
+                    data_b64 = (params.get('data') or '')
+                    meta = params.get('metadata') or {}
+                    vs = meta.get('visibleSize') or {}
+                    vp = page.viewport_size or {}
+                    vw = vs.get('width') or vp.get('width') or 0
+                    vh = vs.get('height') or vp.get('height') or 0
+                    if data_b64 and data_b64 != last_frame:
+                        await websocket.send_json({
+                            'type': 'frame',
+                            'data': data_b64,
+                            'vw': vw, 'vh': vh,
+                            'interactive': _page_interactive(w),
+                            'phase': w.phase if w else '',
+                        })
+                        last_frame = data_b64
+                        frames_sent, fps_logged_at = _log_sent_fps(
+                            wid, frames_sent, fps_logged_at)
+                        continue
+                # No new/unchanged frame yet → lightweight heartbeat.
+                await websocket.send_json({'type': 'ping',
+                                           'interactive': _page_interactive(w),
+                                           'phase': w.phase if w else ''})
                 continue
             try:
                 frame = await page.screenshot(type='jpeg', quality=BROWSER_JPEG_QUALITY)
@@ -819,16 +956,8 @@ async def browser_stream(websocket: WebSocket, website_id: str):
                     'phase': w.phase if w else '',
                 })
                 last_frame = frame
-                # Log achieved fps every ~2s so the real rate (vs the encode
-                # floor on slow VMs) is observable without extra tooling.
-                frames_sent += 1
-                now = asyncio.get_running_loop().time()
-                if now - fps_logged_at >= 2.0:
-                    fps = frames_sent / max(now - fps_logged_at, 1e-6)
-                    print(f'[browser-ws] {wid} ~{fps:.1f}fps sent '
-                          f'(BROWSER_FPS={BROWSER_FPS:g})')
-                    frames_sent = 0
-                    fps_logged_at = now
+                frames_sent, fps_logged_at = _log_sent_fps(
+                    wid, frames_sent, fps_logged_at)
             else:
                 # Lightweight heartbeat so the client knows the stream is live.
                 await websocket.send_json({'type': 'ping',
@@ -838,6 +967,10 @@ async def browser_stream(websocket: WebSocket, website_id: str):
         pass
     except Exception:
         pass
+    finally:
+        if cdp is not None:
+            await _stop_screencast(cdp)
+            cdp, cdp_page = None, None
 
 
 async def _drain_view_events(websocket: WebSocket, wid: UUID, timeout: float = 0.05) -> bool:

@@ -47,8 +47,9 @@ process memory (restart loses events, websites, scripts, settings).
 
 - Requires a Python 3.12 venv with the deps in `pyproject.toml`. Existing interpreter lives
   in `.venv` (symlinked to a system Python on the user's machine).
-- The browser uses **Firefox** (visible window by default so the human can watch/approve;
-  set `HEADLESS=1` for headless servers).
+- The browser uses **Chromium** by default (`BROWSER=firefox` to switch back) — Chromium
+  is required for the live view's CDP screencast streaming. Visible window by default so
+  the human can watch/approve; set `HEADLESS=1` for headless servers.
 - LLM calls go to **OpenRouter** (`https://openrouter.ai/api`) with the model set in
   `state.py` (`MODEL`; currently `deepseek/deepseek-v4.1-flash` — swap to a vision-capable
   model e.g. gpt-4o/claude to make `take_screenshot()` useful). An `OPENROUTER_API_KEY`
@@ -219,13 +220,15 @@ main.py       <- depends on everything; imports agents/serialization/state
   no inline inputs on the panel. '+ Add event (draft)' sends the selected event as a draft.
 - **Embedded browser view:** while a website is being set up or a scripted run is being
   reviewed, a "Live page" panel streams **JPEG screenshots** of the server's real
-  Playwright page over a WebSocket (`/api/browser/{id}/ws`). The target rate is configured
-  by `BROWSER_FPS` (default 4) — but it's a *ceiling*: each frame is a CPU-bound JPEG
-  encode in the browser process, so on loaded/small VMs the encode time (not the setting)
-  determines the real rate. `BROWSER_JPEG_QUALITY` (default 80) trades encode speed/frame
-  size against sharpness — drop it on constrained hardware. The event poll is kept a
-  fraction of the frame budget so it never gates frame production. Unchanged frames are
-  deduped (a quiet page just gets a lightweight `ping` heartbeat, so bandwidth stays low).
+  Playwright page over a WebSocket (`/api/browser/{id}/ws`). With the default
+  **chromium** engine it uses CDP `Page.screencast` — a continuous pipeline where the
+  browser streams JPEG frames it's already compositing, so the fps ceiling is far higher
+  than per-frame screenshots (Firefox has no CDP screencast, so it falls back to
+  `page.screenshot()`). The target rate is configured by `BROWSER_FPS` (default 4) — a
+  *ceiling*. `BROWSER_JPEG_QUALITY` (default 80) trades encode speed/frame size against
+  sharpness — drop it on constrained hardware. The event poll is kept a fraction of the frame
+  budget so it never gates frame production. Unchanged frames are deduped (a quiet page just
+  gets a lightweight `ping` heartbeat, so bandwidth stays low).
   The stream logs achieved fps every ~2s (`[browser-ws] ... ~X.Xfps sent`). It is
   **view-only** while the AI is working (manual_fill/writing/running) and becomes
   **interactive** during approval phases and scripted-run review: clicks/types/scroll are

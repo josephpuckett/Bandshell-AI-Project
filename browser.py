@@ -40,9 +40,17 @@ class Manager:
 
     async def start(self):
         self.manager: Playwright = await async_playwright().start()
+        # Browser engine: chromium (default — enables the embedded view's CDP
+        # screencast streaming, far more efficient than per-frame screenshots)
+        # or firefox (no CDP → the view falls back to page.screenshot()).
+        # BROWSER=chromium|firefox overrides.
+        engine = os.getenv("BROWSER", "chromium").strip().lower()
         # Visible window by default (the human watches); HEADLESS=1 for servers.
-        self.browser: Browser = await self.manager.firefox.launch(
-            headless=os.getenv("HEADLESS") == "1")
+        headless = os.getenv("HEADLESS") == "1"
+        if engine == "firefox":
+            self.browser: Browser = await self.manager.firefox.launch(headless=headless)
+        else:
+            self.browser: Browser = await self.manager.chromium.launch(headless=headless)
         self.sessions: dict[str, Session] = {}
     async def get_session(self):
         id = get_context().session_id

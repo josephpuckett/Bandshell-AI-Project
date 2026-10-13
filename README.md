@@ -41,14 +41,14 @@ guided setup.
 | Variable | Effect |
 |----------|--------|
 | `OPENROUTER_FALLBACK_MODELS` | Comma-separated fallback models used when the primary is rate-limited |
+| `BROWSER` | Playwright engine: `chromium` (default) or `firefox`. Chromium enables the live view's CDP screencast streaming (see below); Firefox falls back to per-frame screenshots |
 | `HEADLESS` | `1` runs the Playwright browser without a visible window (needed on headless servers) |
-| `BROWSER_FPS` | Live-view target frame rate (default `4`, max `60`). A ceiling — the actual rate is also bounded by how fast the Playwright JPEG encode runs (slow on small VMs), and unchanged frames are deduped anyway. Raise only on beefy hardware |
+| `BROWSER_FPS` | Live-view target frame rate (default `4`, max `60`). A ceiling — the actual rate is bounded by the CDP/screenshot pipeline and the VM's CPU; unchanged frames are deduped anyway |
 | `BROWSER_JPEG_QUALITY` | Live-view JPEG quality (default `80`, range 30–95). Lower = faster encode + smaller frames (the encode is the CPU floor on small VMs); a small visual cost in the watching view |
 | `EVENTBRITE_TOKEN` | Enables Eventbrite API websites (draft events, no publishing) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` + `EVENTS_SPREADSHEET_ID` | Google Sheets persistence (Events / Websites / Settings worksheets) |
 
-(The browser is currently hardcoded to Playwright Firefox in `browser.py`; chromium works
-with a one-line swap. On a headless server you'll want `headless=True` there.)
+(The browser engine is set via the `BROWSER` env var, default `chromium`.)
 
 ### Serving externally
 
@@ -109,8 +109,11 @@ per restart — consider a static domain for anything persistent.
 - **Image URLs:** Google Drive share links are rewritten to direct-download URLs before the
   agent or script uses them. A link that isn't shared ("Anyone with the link") is caught by a
   preflight check and logs a clear warning instead of failing opaquely.
-- **The embedded view is a stream of JPEG screenshots** (rate = `BROWSER_FPS`, default 4fps
-  over a WebSocket), not a real iframe. It's view-only while the AI works, interactive during
+- **The embedded view is a stream of JPEG frames** (rate = `BROWSER_FPS`, default 4fps
+  over a WebSocket), not a real iframe. With the default **chromium** engine it uses CDP
+  `Page.screencast` (a continuous optimized pipeline — the browser streams frames it's
+  already compositing; no per-frame re-capture), falling back to `page.screenshot()`
+  per-frame on Firefox. It's view-only while the AI works, interactive during
   approval/review phases.
   Because it's imagery, text in the page can't be copied from it — but you can paste *into*
   it with Ctrl/Cmd+V (reads your OS clipboard, inserts into the focused field).
