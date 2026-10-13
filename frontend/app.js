@@ -255,6 +255,37 @@ let browserStreamingWid = null;
 let browserVW = 0, browserVH = 0; // live page viewport size (natural frame dims)
 let browserHintOverride = "";   // transient hint text (native-picker tip) shown in place of defaults
 let pendingScroll = null;        // coalesced wheel deltas waiting to flush
+let browserHadFrame = false;     // a live frame has been shown for this stream
+let browserInteractive = false;  // server's last reported interactivity (sticky across reconnects)
+let browserLastMsg = 0;          // timestamp of the last WS message (staleness watchdog)
+let browserWatchdog = null;      // setInterval handle
+let browserGen = 0;              // generation: guards against stale sockets/handlers
+let browserFailStreak = 0;       // consecutive failed connections (for reconnect backoff)
+
+// Force-reconnect when the WS is open but no message arrives for a while.
+// Open-but-silent sockets never fire onclose (esp. when the server handler is
+// wedged — the close handshake hangs), so we can't rely on close()/onclose:
+// we detach the old socket and open a fresh one directly.
+function startBrowserWatchdog() {
+    stopBrowserWatchdog();
+    browserLastMsg = Date.now();
+    browserWatchdog = setInterval(() => {
+        if (!browserStreamingWid) return;
+        const silentFor = Date.now() - browserLastMsg;
+        // Server pings at ~4fps even on a quiet page, so 6s of silence is
+        // definitively a dead stream.
+        if (silentFor > 6000) {
+            console.warn(`[browser-ws] no messages for ${silentFor}ms — reconnecting`);
+            browserGen++;                 // invalidate the old socket's handlers
+            browserWs = null;
+            openBrowserStream(browserStreamingWid);
+        }
+    }, 2000);
+}
+
+function stopBrowserWatchdog() {
+    if (browserWatchdog) { clearInterval(browserWatchdog); browserWatchdog = null; }
+}
 
 function browserWsUrl(id) {
     const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -266,13 +297,20 @@ function openBrowserStream(id) {
     browserStreamingWid = id;
     const hint = document.getElementById("browserHint");
     hint.textContent = "Connecting to the live page…";
+    const gen = ++browserGen;             // this connection's generation
+    let ws;
     try {
-        browserWs = new WebSocket(browserWsUrl(id));
+        ws = new WebSocket(browserWsUrl(id));
     } catch (_) {
         hint.textContent = "Live view unavailable (WebSocket failed to connect).";
         return;
     }
-    browserWs.onmessage = (ev) => {
+    browserWs = ws;
+    startBrowserWatchdog();
+    ws.onmessage = (ev) => {
+        if (browserWs !== ws) return;     // stale socket: ignore
+        browserFailStreak = 0;            // connected fine — reset backoff
+        browserLastMsg = Date.now();
         let msg;
         try { msg = JSON.parse(ev.data); } catch (_) { return; }
         const stage = document.getElementById("browserStage");
@@ -286,6 +324,7 @@ function openBrowserStream(id) {
             frame.src = "data:image/jpeg;base64," + msg.data;
             ph.hidden = true;
             stage.classList.remove("placeholder");
+            browserHadFrame = true;
             setBrowserInteractive(int, phase);
         } else if (msg.type === "hint") {
             // Server-side tip: the focused control's popup can't be captured
@@ -296,6 +335,7 @@ function openBrowserStream(id) {
         } else if (msg.type === "empty") {
             browserVW = 0; browserVH = 0;
             browserHintOverride = "";
+            browserHadFrame = false;
             frame.removeAttribute("src");
             ph.hidden = false;
             ph.textContent = "No live page right now — it appears after onboarding starts or a script runs.";
@@ -309,17 +349,24 @@ function openBrowserStream(id) {
             setBrowserInteractive(int, phase);
         }
     };
-    browserWs.onclose = (ev) => {
+    ws.onclose = (ev) => {
+        if (browserWs !== ws) return;     // a newer socket replaced us
+        if (browserStreamingWid !== id) return;
         const why = ev && (ev.code || ev.reason)
             ? ` (code ${ev.code}${ev.reason ? `: ${ev.reason}` : ""})` : "";
         browserWs = null;
-        if (browserStreamingWid === id) {
-            document.getElementById("browserHint").textContent =
-                `Live view disconnected — reconnecting…${why}`;
-            setTimeout(() => { if (browserStreamingWid === id) openBrowserStream(id); }, 2000);
-        }
+        if (gen !== browserGen) return;   // watchdog already reopened
+        document.getElementById("browserHint").textContent =
+            `Live view disconnected — reconnecting…${why}`;
+        // Exponential backoff: each failure doubles the wait (2s, 4s, 8s… cap
+        // 15s). Reset on the next successful message.
+        const delay = Math.min(2000 * Math.pow(2, browserFailStreak), 15000);
+        browserFailStreak++;
+        setTimeout(() => { if (browserStreamingWid === id && gen === browserGen) openBrowserStream(id); },
+                   delay);
     };
-    browserWs.onerror = () => {
+    ws.onerror = () => {
+        if (browserWs !== ws) return;
         if (browserStreamingWid === id) {
             document.getElementById("browserHint").textContent =
                 `Couldn't reach the live browser over WebSocket (${browserWsUrl(id)}). `
@@ -329,8 +376,13 @@ function openBrowserStream(id) {
 }
 
 function closeBrowserStream() {
+    stopBrowserWatchdog();
+    browserGen++;                 // invalidate any in-flight socket/handler
+    browserFailStreak = 0;
     browserStreamingWid = null;
     browserHintOverride = "";
+    browserHadFrame = false;
+    browserLastMsg = 0;
     if (browserWs) { try { browserWs.close(); } catch (_) { } browserWs = null; }
     document.getElementById("browserFrame").removeAttribute("src");
     const ph = document.getElementById("browserPlaceholder");
@@ -339,7 +391,6 @@ function closeBrowserStream() {
     setBrowserInteractive(false, "");
 }
 
-let browserInteractive = false;
 function setBrowserInteractive(v, phase) {
     browserInteractive = v;
     const hint = document.getElementById("browserHint");
@@ -406,7 +457,10 @@ function browserCoord(e) {
         browserSend({ type: "click", x, y });
     });
     stage.addEventListener("wheel", (e) => {
-        if (!streamOpen()) return; // no live page: let the app page scroll normally
+        // While a live page was recently shown, keep the wheel captured so
+        // transient WS hiccups can't leak scrolls into the app page; only when
+        // there is genuinely no live view do we let the app scroll normally.
+        if (!streamOpen() && !browserHadFrame) return; // no live page: let the app page scroll normally
         e.preventDefault();
         const { x, y } = browserCoord(e);
         // Normalize per-notch wheel deltas (Firefox: 3, Safari: 40) to roughly

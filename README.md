@@ -114,7 +114,9 @@ per restart — consider a static domain for anything persistent.
   `Page.screencast` (a continuous optimized pipeline — the browser streams frames it's
   already compositing; no per-frame re-capture), falling back to `page.screenshot()`
   per-frame on Firefox. It's view-only while the AI works, interactive during
-  approval/review phases.
+  approval/review phases. Note: native browser popups (date pickers, select dropdowns)
+  are browser-chrome and don't appear in the captured stream — the UI hints you to type
+  or use the keyboard instead.
   Because it's imagery, text in the page can't be copied from it — but you can paste *into*
   it with Ctrl/Cmd+V (reads your OS clipboard, inserts into the focused field).
 - **The agent's browser window closes** when its interaction finishes; a website left

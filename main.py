@@ -890,7 +890,10 @@ async def browser_stream(websocket: WebSocket, website_id: str):
                 # Make menu clicks visible immediately: skip the fps gate this
                 # iteration so the freshest frame is sent right away.
                 next_frame_at = 0.0
-                await _hint_native_control(wid, websocket)
+                try:
+                    await asyncio.wait_for(_hint_native_control(wid, websocket), 5.0)
+                except Exception:
+                    pass
             tick = asyncio.get_running_loop().time()
             if tick < next_frame_at:
                 # Small bounded sleep: keeps the frame clock honest while still
@@ -898,87 +901,141 @@ async def browser_stream(websocket: WebSocket, website_id: str):
                 await asyncio.sleep(min(0.02, next_frame_at - tick))
                 continue
             next_frame_at = tick + frame_interval
-            w = websites.get(wid)
-            page = await _resolve_live_page(wid)
-            if page is None:
+            try:
+                w = websites.get(wid)
+                page = await _resolve_live_page(wid)
+                if page is None:
+                    if cdp is not None:
+                        await _stop_screencast(cdp)
+                        cdp, cdp_page = None, None
+                    if not await _safe_send(websocket, {'type': 'empty', 'interactive': False,
+                                                        'phase': w.phase if w else ''}):
+                        break
+                    last_frame = None
+                    continue
+                # (Re)attach the CDP screencast when the visible page changes.
+                if cdp_page is not page:
+                    if cdp is not None:
+                        try:
+                            await _stop_screencast(cdp)
+                        except Exception:
+                            pass
+                    try:
+                        cdp = await asyncio.wait_for(_start_screencast(page), 5.0)
+                    except Exception:
+                        cdp = None
+                    cdp_page = page  # remember even if None (avoid retry every tick)
                 if cdp is not None:
-                    await _stop_screencast(cdp)
-                    cdp, cdp_page = None, None
-                await websocket.send_json({'type': 'empty', 'interactive': False,
-                                           'phase': w.phase if w else ''})
-                last_frame = None
-                continue
-            # (Re)attach the CDP screencast when the visible page changes.
-            if cdp_page is not page:
-                if cdp is not None:
-                    await _stop_screencast(cdp)
-                cdp = await _start_screencast(page)
-                cdp_page = page  # remember even if None (avoid retry every tick)
-            if cdp is not None:
-                # CDP screencast: send the freshest frame if we have one.
-                params = None
+                    # CDP screencast: send the freshest frame if we have one.
+                    params = None
+                    try:
+                        params = cdp[1].get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    if params is not None:
+                        data_b64 = (params.get('data') or '')
+                        meta = params.get('metadata') or {}
+                        vs = meta.get('visibleSize') or {}
+                        try:
+                            vp = page.viewport_size or {}
+                        except Exception:
+                            vp = {}
+                        vw = vs.get('width') or vp.get('width') or 0
+                        vh = vs.get('height') or vp.get('height') or 0
+                        if data_b64 and data_b64 != last_frame:
+                            if not await _safe_send(websocket, {
+                                    'type': 'frame',
+                                    'data': data_b64,
+                                    'vw': vw, 'vh': vh,
+                                    'interactive': _page_interactive(w),
+                                    'phase': w.phase if w else ''}):
+                                break
+                            last_frame = data_b64
+                            frames_sent, fps_logged_at = _log_sent_fps(
+                                wid, frames_sent, fps_logged_at)
+                            continue
+                    # No new/unchanged frame yet → lightweight heartbeat.
+                    if not await _safe_send(websocket, {'type': 'ping',
+                                                        'interactive': _page_interactive(w),
+                                                        'phase': w.phase if w else ''}):
+                        break
+                    continue
                 try:
-                    params = cdp[1].get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                if params is not None:
-                    data_b64 = (params.get('data') or '')
-                    meta = params.get('metadata') or {}
-                    vs = meta.get('visibleSize') or {}
-                    vp = page.viewport_size or {}
-                    vw = vs.get('width') or vp.get('width') or 0
-                    vh = vs.get('height') or vp.get('height') or 0
-                    if data_b64 and data_b64 != last_frame:
-                        await websocket.send_json({
+                    # Bound the capture: a hung page/browser must not wedge the
+                    # stream loop (that froze the view and dropped input).
+                    frame = await asyncio.wait_for(
+                        page.screenshot(type='jpeg', quality=BROWSER_JPEG_QUALITY), 3.0)
+                    vw, vh = page.viewport_size or (0, 0)
+                except Exception:
+                    # Page closed under us (e.g. a run was finished/cancelled).
+                    clear_live_page(wid)
+                    if not await _safe_send(websocket, {'type': 'empty', 'interactive': False,
+                                                        'phase': w.phase if w else ''}):
+                        break
+                    last_frame = None
+                    continue
+                if frame != last_frame:
+                    if not await _safe_send(websocket, {
                             'type': 'frame',
-                            'data': data_b64,
+                            'data': b64encode(frame).decode('ascii'),
                             'vw': vw, 'vh': vh,
                             'interactive': _page_interactive(w),
-                            'phase': w.phase if w else '',
-                        })
-                        last_frame = data_b64
-                        frames_sent, fps_logged_at = _log_sent_fps(
-                            wid, frames_sent, fps_logged_at)
-                        continue
-                # No new/unchanged frame yet → lightweight heartbeat.
-                await websocket.send_json({'type': 'ping',
-                                           'interactive': _page_interactive(w),
-                                           'phase': w.phase if w else ''})
-                continue
-            try:
-                frame = await page.screenshot(type='jpeg', quality=BROWSER_JPEG_QUALITY)
-                vw, vh = page.viewport_size or (0, 0)
+                            'phase': w.phase if w else ''}):
+                        break
+                    last_frame = frame
+                    frames_sent, fps_logged_at = _log_sent_fps(
+                        wid, frames_sent, fps_logged_at)
+                else:
+                    # Lightweight heartbeat so the client knows the stream is live.
+                    if not await _safe_send(websocket, {'type': 'ping',
+                                                        'interactive': _page_interactive(w),
+                                                        'phase': w.phase if w else ''}):
+                        break
+            except WebSocketDisconnect:
+                raise
             except Exception:
-                # Page closed under us (e.g. a run was finished/cancelled).
+                # Transient page/CDP hiccup (e.g. the agent's page closed mid-
+                # fill on some sites): degrade to 'empty' and keep the stream
+                # alive instead of letting the error kill the whole handler
+                # (which froze the view and let wheels hit the app page).
+                if cdp is not None:
+                    try:
+                        await _stop_screencast(cdp)
+                    except Exception:
+                        pass
+                    cdp, cdp_page = None, None
                 clear_live_page(wid)
-                await websocket.send_json({'type': 'empty', 'interactive': False,
-                                           'phase': w.phase if w else ''})
+                if not await _safe_send(websocket, {'type': 'empty', 'interactive': False,
+                                                    'phase': (websites.get(wid).phase
+                                                              if wid in websites else '')}):
+                    break
                 last_frame = None
-                continue
-            if frame != last_frame:
-                await websocket.send_json({
-                    'type': 'frame',
-                    'data': b64encode(frame).decode('ascii'),
-                    'vw': vw, 'vh': vh,
-                    'interactive': _page_interactive(w),
-                    'phase': w.phase if w else '',
-                })
-                last_frame = frame
-                frames_sent, fps_logged_at = _log_sent_fps(
-                    wid, frames_sent, fps_logged_at)
-            else:
-                # Lightweight heartbeat so the client knows the stream is live.
-                await websocket.send_json({'type': 'ping',
-                                           'interactive': _page_interactive(w),
-                                           'phase': w.phase if w else ''})
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
         if cdp is not None:
-            await _stop_screencast(cdp)
+            try:
+                await _stop_screencast(cdp)
+            except Exception:
+                pass
             cdp, cdp_page = None, None
+
+
+async def _safe_send(websocket: WebSocket, obj: dict, timeout: float = 5.0) -> bool:
+    """Send a WS message without letting backpressure wedge the stream loop.
+
+    Returns False if the client is gone, refusing capacity, or the send didn't
+    complete in time (slow tunnel / backgrounded tab). The caller breaks out of
+    the loop instead of letting send_json() await forever while events pile up.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            await websocket.send_json(obj)
+        return True
+    except (asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
+        return False
 
 
 async def _drain_view_events(websocket: WebSocket, wid: UUID, timeout: float = 0.05,
@@ -1004,7 +1061,13 @@ async def _drain_view_events(websocket: WebSocket, wid: UUID, timeout: float = 0
                         saw_click = True
                 except Exception:
                     pass
-            await _handle_view_event(wid, raw)
+            # Bound the replay of a single event too: a hung page must not block
+            # the drain (and thus the whole stream) waiting on a click/type that
+            # will never complete.
+            try:
+                await asyncio.wait_for(_handle_view_event(wid, raw), 5.0)
+            except Exception:
+                pass
             saw = True
             count += 1
         except asyncio.TimeoutError:

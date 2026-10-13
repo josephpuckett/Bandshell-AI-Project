@@ -229,7 +229,16 @@ main.py       <- depends on everything; imports agents/serialization/state
   sharpness — drop it on constrained hardware. The event poll is kept a fraction of the frame
   budget so it never gates frame production (event batches are capped so a scroll/typing
   flood can't starve frames — the view keeps streaming while you scroll, and clicks flush
-  a frame immediately). Unchanged frames are deduped (a quiet page just
+  a frame immediately). Transient page/CDP errors degrade to `empty` and the stream stays
+  alive (they don't kill the WS, which would freeze the view and let wheels hit the app
+  page); Playwright ops + WS sends are timeout-bounded (3–5s) so a hung page or slow
+  tunnel can't wedge the handler. The client also keeps the wheel captured while a frame
+  was recently shown (reconnect blips never scroll the app) and runs a staleness watchdog:
+  open-but-silent sockets (no frame/ping for 6s) are **force-reopened directly** (a
+  wedged server never completes the close handshake, so relying on close()/onclose alone
+  froze the view until a manual refresh). Sockets are generation-tagged: stale handlers
+  are ignored, deliberate closes can't reopen, and reconnects use exponential backoff
+  (2s→15s, reset on a successful message). Unchanged frames are deduped (a quiet page just
   gets a lightweight `ping` heartbeat, so bandwidth stays low).
   The stream logs achieved fps every ~2s (`[browser-ws] ... ~X.Xfps sent`). It is
   **view-only** while the AI is working (manual_fill/writing/running) and becomes
