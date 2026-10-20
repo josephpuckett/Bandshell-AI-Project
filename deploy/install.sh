@@ -38,7 +38,7 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-PORT="${PORT:-8000}"
+PORT="${PORT:-8080}"
 SERVER_NAME="${SERVER_NAME:-_}"      # nginx server_name; "_" = catch-all
 SITE_NAME="${SITE_NAME:-bandshell}"
 DOMAIN="${DOMAIN:-}"                 # set → configure certbot TLS for this name
