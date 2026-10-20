@@ -22,7 +22,8 @@ from browser import clear_live_page, manager
 from eventbrite_api import check_direct_image_url, direct_image_url
 from scripter import (codegen_prompt, extract_code, extract_tool_calls,
                       initial_task_message, initial_website_message, strip_aria)
-from scripting import run_script_against_event, validate_script
+from scripting import (SANDBOX_ERROR_PREFIX, run_script_against_event,
+                      validate_script)
 from serialization import current_settings_version
 from state import (MODEL, TOKEN, URL, DONE_WORDS, FALLBACK_MODELS, events,
                    input_queues, parent, tasks, website_queues, websites)
@@ -225,6 +226,11 @@ async def run_onboarding(website_id, event_id):
                 ok, msg2, page, context = await run_script_against_event(
                     script, event, live_key=website_id)
                 if not ok:
+                    if msg2.startswith(SANDBOX_ERROR_PREFIX):
+                        # The sandbox itself failed before running any of the
+                        # generated code — asking the LLM to rewrite the script
+                        # would burn attempts on an infra problem. Surface it.
+                        raise RuntimeError(msg2)
                     feedback = (
                         f'The generated script failed while running: {msg2}.\n'
                         'Fix the script based on that runtime error so it succeeds.\n'

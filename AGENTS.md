@@ -25,7 +25,11 @@ process memory (restart loses events, websites, scripts, settings).
 | `main.py` | FastAPI app + route handlers (app wiring, lifespan, all `/api/*` endpoints). Entry point. |
 | `state.py` | Shared global state/config: LLM provider, mounted browser MCP (`parent`), frontend path, and all in-memory registries + settings. |
 | `agents.py` | Long-running agent orchestration: `run_onboarding` and `run_task` state machines. |
-| `scripting.py` | Safe script execution: `Driver` (the `api` surface), `validate_script`, `execute_script_in_process`, `run_script_against_event`. Pages opened for scripted runs get a pinned `VIEWPORT=(1280, 850)` (desktop size for the embedded view). |
+| `scripting.py` | Safe script execution: `Driver` (the `api` surface), `validate_script`, `execute_script_in_process`, `run_script_against_event`. Pages opened for scripted runs get a pinned `VIEWPORT=(1280, 850)` (desktop size for the embedded view). `run_script_against_event` executes the script inside the bwrap sandbox when available, else in-process. |
+| `sandbox_framing.py` | MCP stdio framing bound to arbitrary pipes (`framed_streams` for the host's asyncio pipe pair, `framed_stdio` for the child's own stdin/stdout). Shared by both sandbox halves; ~50 lines on top of the SDK's `JSONRPCMessage`/`SessionMessage`. |
+| `sandbox_host.py` | Host side of the sandbox: a low-level `mcp` `Server` bound to the bwrap child's pipes, exposing exactly the 11 `ALLOWED_API` ops plus the `get_job`/`report` bootstrap tools, all dispatching into the real `Driver` against the review page. Per-run instance; caps calls and argument sizes. |
+| `sandbox_runner.py` | Sandbox side: the only code executed inside bwrap. A `fastmcp.Client` over its **own** stdin/stdout (inverted stdio — it cannot spawn), fetches `get_job`, `exec`s the script in a scrubbed namespace, forwards each `api.*` as an MCP `tools/call`, reports the outcome, exits. **stdout is the wire** — script output is redirected to stderr. |
+| `tools/sandbox_smoke.py` | VM smoke test for the sandbox bridge (bwrap flags, fd/pipe inheritance, framing both ways, event delivery, stdout hygiene, error propagation, runaway timeout). Uses a stub dispatcher, so it needs no browser. |
 | `scripter.py` | Prompt builders (`codegen_prompt`, `initial_*_message`) + code extraction helpers. |
 | `serialization.py` | Dataclass→API-dict serialization (`event_out`, `website_out`, ...) + `asset_url`, `current_settings_version`, `_parse_event_id`. |
 | `bot.py` | `Bot` class: HTTP client for the LLM (httpx), manages the tool-call loop. Every completion sends `max_tokens=8192` (runaway-generation guard). Timeout is `httpx.Timeout(connect=10, read=600, write=30, pool=10)` — the read budget is generous because a max-size generation at a slow provider can take minutes; a too-short read was silently dropping large-but-valid responses. 4-attempt retry: `_TransientError` (429 rate limit / 5xx, also HTTP-200-with-error bodies) backs off honoring `Retry-After` (capped at 30s); other failures retry with backoff; every attempt logs (elapsed + error) to `logs/llm_usage.jsonl` and success logs `finish=... in=... out=... elapsed=...`; total failure raises a descriptive `RuntimeError` (URL/status/body). Optional OpenRouter fallback models via `state.FALLBACK_MODELS` (env `OPENROUTER_FALLBACK_MODELS`, sent as the `models` array). Cancellation (`asyncio.CancelledError`) propagates. |
@@ -60,6 +64,21 @@ process memory (restart loses events, websites, scripts, settings).
 - Optional features (off by default, enabled by env vars):
   - **Eventbrite** websites: `EVENTBRITE_TOKEN`
   - **Google Sheets persistence**: `GOOGLE_SERVICE_ACCOUNT_JSON` (JSON content or path to the JSON file) + `EVENTS_SPREADSHEET_ID`
+  - **Script sandbox**: `SCRIPT_SANDBOX=auto` (default — bwrap when installed, else in-process),
+    `1`/`require` (fail the run if bwrap is missing), `0` (always in-process). Also
+    `BWRAP` (binary path), `SANDBOX_TIMEOUT` (wall-clock seconds per run, default 120),
+    `SANDBOX_CLIENT` (`auto`|`fastmcp`|`mcp` — the MCP client used inside the sandbox),
+    `SANDBOX_CPU_SECONDS` (30) and `SANDBOX_MAX_MEMORY_MB` (1024).
+    Install with `apt-get install bubblewrap`; verify with `python3 tools/sandbox_smoke.py`.
+    The runner prints `[sandbox-runner] start ...` / `client=... ready` breadcrumbs to
+    stderr (mirrored by the host as `[sandbox] ...`) so a startup failure is pinpointed.
+    Verified end-to-end against bwrap 0.13.1 + CPython 3.12.15 + fastmcp 3.4.4 + mcp
+    1.28.1: the smoke test passes on both `SANDBOX_CLIENT` paths, and a generated script
+    drives a real Chromium page through the bridge. Measured cost: the sandboxed client
+    peaks at ~54 MB RSS (~76 MB VA), so it is NOT a memory hog — a 137/SIGKILL is not
+    explained by the MCP client's imports.
+    `SANDBOX_ERROR_PREFIX` (`sandbox-unavailable:`) marks failures where the script never
+    ran; `agents.py` aborts on that prefix instead of asking the LLM to rewrite.
 
 ```
 uvicorn main:app --host 127.0.0.1 --port 8000
@@ -176,10 +195,30 @@ main.py       <- depends on everything; imports agents/serialization/state
   rejects imports, disallowed names/calls/dangerous patterns, and requires the `run()` shape.
   This is the defense against **prompt/code injection** (a malicious calendar site trying to
   steer the agent into generating malicious code). The prompt also instructs the agent that
-  page text is untrusted DATA.
-- Planned future: run generated scripts in a **sandboxed separate process** (e.g. bubblewrap)
-  so malicious code is contained. The tight `Driver` `api` interface is designed so that swap
-  is confined to the execution layer.
+  page text is untrusted DATA. `run_script_against_event` re-runs `validate_script` too, so a
+  script loaded from storage is never executed unvalidated.
+- **Sandbox (defense in depth):** the validated script then runs inside **bubblewrap** with
+  `--clearenv` (no API keys/tokens), `--unshare-net/pid/ipc/uts` (no network, no fork),
+  an empty `--tmpfs /` root with only `/usr`, `/lib*`, `/bin`, `/proc`, `/dev` and a
+  **whitelist of project files** (`.venv`, `sandbox_runner.py`, `sandbox_framing.py`,
+  `event.py`) bound read-only. CPU/memory/fd/process ceilings are **not** bwrap flags —
+  bubblewrap has no `--rlimit-*` options — they are set from inside by `sandbox_runner.py`
+  via `resource.setrlimit()` (soft == hard, so the untrusted script can't raise them), on top
+  of the host's wall-clock `SANDBOX_TIMEOUT` kill. A one-time **preflight** (`_bwrap_preflight`
+  in `scripting.py`) runs the real argv with the script swapped for `-c 'import sys'`, so a
+  bad bwrap version/flag/mount is reported up front instead of failing mid-onboarding;
+  in `auto` mode it logs and falls back to in-process, in `SCRIPT_SANDBOX=1` mode it aborts.
+  Everything the script can *do* is
+  the 11-op driver surface — served by the **host** over MCP-stdio, against the same review
+  page the human sees. Enabled/disabled with `SCRIPT_SANDBOX` (auto|1|0); when bwrap is
+  missing it falls back to in-process `exec`. Design + threat model: `docs/sandbox-plan.md`.
+- **Transport note (don't re-litigate):** the sandbox uses MCP **stdio with the direction
+  inverted** — the host is the *server* on the child's pipes and the child is the *client*
+  on its own stdin/stdout. HTTP was rejected because `--unshare-net` leaves no working
+  loopback (it would force either dropping net isolation or bringing `lo` up with
+  CAP_NET_ADMIN), a listener adds an OS-level surface reachable by any local process, and
+  stdio gives free death detection (pipe EOF). Since MCP's stdio framing is symmetric
+  newline-delimited JSON-RPC, only the byte-stream *source* is custom (`sandbox_framing.py`).
 
 ## Settings versioning / staleness
 

@@ -9,15 +9,32 @@ For now scripts run in-process. Later this may move behind a sandbox
 (bubblewrap) via the same tight `api` interface, so only this module changes.
 """
 import ast
+import asyncio
+import contextlib
+import shutil
+import signal
+import subprocess
+from dataclasses import asdict
 from dataclasses import replace as dataclass_replace
+from pathlib import Path
 
 from browser import manager, set_live_page
 from event import Event
 from eventbrite_api import direct_image_url
+from state import (BWRAP, SANDBOX_CLIENT, SANDBOX_CPU_SECONDS,
+                   SANDBOX_MAX_MEMORY_MB, SANDBOX_TIMEOUT, SCRIPT_SANDBOX)
 from website import Script
 
 
 VIEWPORT = (1280, 850)  # desktop-size viewport for the embedded browser view
+
+# Where the sandbox root lives inside bwrap (nothing else from the repo is bound).
+SANDBOX_DIR = '/app'
+
+# Prefix for failures that mean "the sandbox could not run at all" rather than
+# "the generated script is wrong". Callers must NOT feed these back to the LLM
+# as a script bug (the code never executed), so they abort with a site error.
+SANDBOX_ERROR_PREFIX = 'sandbox-unavailable:'
 
 
 class Driver:
@@ -216,6 +233,12 @@ async def run_script_against_event(script: Script, event: Event, live_key=None):
     returned as (False, error_msg, None, None) so the caller can ask the agent to
     rewrite, instead of crashing the whole onboarding.
 
+    The script itself is executed inside a **bubblewrap sandbox** when available
+    (`SCRIPT_SANDBOX=auto`), with the host serving only the allowlisted driver
+    tools to it over MCP-stdio. The page stays here on the host, so the review
+    flow / embedded view / LIVE_PAGES are unchanged. When bwrap is missing (or
+    SCRIPT_SANDBOX=0) the script `exec`s in-process exactly as before.
+
     If `live_key` is given (a website_id), the page is registered in
     browser.LIVE_PAGES as soon as it is created, so the embedded view streams
     the *actual* run as it happens instead of a stale fallback page.
@@ -223,12 +246,35 @@ async def run_script_against_event(script: Script, event: Event, live_key=None):
     # Scripts read event.image at run time; hand them a directly-fetchable URL
     # (Drive share links rewritten), matching what the agent saw during onboarding.
     event = dataclass_replace(event, image=direct_image_url(event.image))
+
+    # Defense in depth: `validate_script` runs during codegen, but nothing
+    # guaranteed it ran for a script loaded from storage.
+    valid, reason = validate_script(script.code)
+    if not valid:
+        return False, f'script rejected by validate_script: {reason}', None, None
+
+    # Decide how to execute BEFORE opening a browser context. The probe may run
+    # bwrap once (cached), so keep it off the event loop.
+    argv, why = await asyncio.to_thread(_sandbox_argv)
+    if argv is None and why:
+        # Sandbox was explicitly required but can't be used: fail loudly rather
+        # than silently downgrading to unsandboxed execution.
+        return False, SANDBOX_ERROR_PREFIX + ' ' + why, None, None
+
     context = await manager.browser.new_context()
     try:
         page = await context.new_page()
         await page.set_viewport_size({'width': VIEWPORT[0], 'height': VIEWPORT[1]})
         if live_key is not None:
             set_live_page(live_key, page)
+
+        if argv is not None:
+            ok, msg = await _run_sandboxed(page, script, event, argv)
+            if not ok:
+                await context.close()
+                return False, msg, None, None
+            return True, 'executed', page, context
+
         api = Driver(page)
         run, _, err = execute_script_in_process(script, event)
         if run is None:
@@ -242,3 +288,258 @@ async def run_script_against_event(script: Script, event: Event, live_key=None):
         except Exception:
             pass
         return False, str(exc), None, None
+
+
+# ---------------------------------------------------------------------------
+# Sandboxed execution (bwrap + MCP-stdio driver bridge)
+# ---------------------------------------------------------------------------
+# Cached result of the one-time bwrap preflight: None = not yet checked.
+_BWRAP_PREFLIGHT: tuple[bool, str] | None = None
+
+
+def _bwrap_preflight(argv) -> tuple[bool, str]:
+    """Check ONCE that this bwrap + these flags + these mounts actually work.
+
+    Runs the real argv with the generated script replaced by `-c 'import sys'`,
+    so any unsupported flag, missing mount or namespace permission problem is
+    reported here — instead of surfacing as an opaque failure in the middle of
+    an onboarding run. Cached: the probe costs one short process per process
+    lifetime.
+    """
+    global _BWRAP_PREFLIGHT
+    if _BWRAP_PREFLIGHT is not None:
+        return _BWRAP_PREFLIGHT
+    probe = list(argv[:-2]) + [argv[-2], '-c', 'import sys']  # keep flags, swap the script
+    try:
+        proc = subprocess.run(probe, capture_output=True, timeout=30)
+    except Exception as exc:
+        _BWRAP_PREFLIGHT = (False, f'could not run bwrap: {exc}')
+        return _BWRAP_PREFLIGHT
+    if proc.returncode == 0:
+        _BWRAP_PREFLIGHT = (True, '')
+        return _BWRAP_PREFLIGHT
+    err = (proc.stderr or b'').decode('utf-8', 'replace').strip().splitlines()
+    reason = err[-1] if err else f'bwrap exited with {proc.returncode}'
+    _BWRAP_PREFLIGHT = (False, f'bwrap preflight failed: {reason}')
+    return _BWRAP_PREFLIGHT
+
+
+def _is_sigkill(rc) -> bool:
+    """True if the process died from SIGKILL (bwrap reports it as 137)."""
+    if rc is None:
+        return False
+    sig = -rc if rc < 0 else (rc - 128 if rc > 128 else None)
+    return sig == int(signal.SIGKILL)
+
+
+def _describe_exit(rc) -> str:
+    """Human-readable process outcome (exit code / killing signal).
+
+    bwrap (like a shell) reports a signalled child as 128+N, so SIGKILL shows up
+    as 137 rather than -9. Handle both conventions.
+    """
+    if rc is None:
+        return 'still running'
+    sig = -rc if rc < 0 else (rc - 128 if rc > 128 else None)
+    if sig is not None and sig > 0:
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f'signal {sig}'
+        return f'killed by {name} ({rc})'
+    return f'exit code {rc}'
+
+
+def _sandbox_argv():
+    """Return (argv, why) for launching the sandboxed runner.
+
+    `argv is None` means "don't sandbox": `why` is empty for the normal
+    auto-fallback case (no bwrap installed → in-process), and non-empty when the
+    operator explicitly required a sandbox that can't be provided.
+    """
+    if SCRIPT_SANDBOX in ('0', 'false', 'off', 'no'):
+        return None, ''
+    required = SCRIPT_SANDBOX in ('1', 'true', 'on', 'yes', 'require')
+    bwrap = shutil.which(BWRAP)
+    if not bwrap:
+        if required:
+            return None, (f'SCRIPT_SANDBOX={SCRIPT_SANDBOX} but {BWRAP!r} was not found on PATH')
+        return None, ''
+
+    root = Path(__file__).resolve().parent
+    venv = root / '.venv'
+    python = venv / 'bin' / 'python3'
+    if not python.exists():
+        if required:
+            return None, f'SCRIPT_SANDBOX={SCRIPT_SANDBOX} but {python} is missing'
+        return None, ''
+
+    # Only the files the runner actually needs are bound read-only: the venv,
+    # the runner, the framing helper and the Event dataclass. The rest of the
+    # repo (logs/, generated/, sheets creds, etc.) is invisible.
+    argv = [
+        bwrap,
+        # Fresh, empty environment: no API keys, no tokens, no PYTHON* knobs.
+        '--clearenv',
+        '--setenv', 'PATH', '/usr/bin:/bin',
+        '--setenv', 'HOME', '/tmp',
+        # Resource ceilings, read by sandbox_runner.py (bwrap has no --rlimit-*).
+        '--setenv', 'SANDBOX_CPU_SECONDS', str(SANDBOX_CPU_SECONDS),
+        '--setenv', 'SANDBOX_MAX_MEMORY_MB', str(SANDBOX_MAX_MEMORY_MB),
+        '--setenv', 'SANDBOX_CLIENT', SANDBOX_CLIENT,
+        '--die-with-parent',
+        # Isolation: no net, no shared pid/ipc/uts namespaces, own session.
+        '--unshare-net', '--unshare-pid', '--unshare-ipc', '--unshare-uts',
+        '--unshare-cgroup-try', '--unshare-user-try', '--new-session',
+        # Empty root first, then the read-only system view on top of it.
+        # (Order matters: a later --tmpfs / would shadow the binds.)
+        '--tmpfs', '/',
+        '--ro-bind', '/usr', '/usr',
+        '--ro-bind-try', '/lib', '/lib',
+        '--ro-bind-try', '/lib64', '/lib64',
+        '--ro-bind-try', '/bin', '/bin',
+        '--ro-bind-try', '/sbin', '/sbin',
+        '--proc', '/proc',
+        '--dev', '/dev',
+        '--tmpfs', '/tmp',
+        # The whitelisted project files.
+        '--ro-bind', str(venv), f'{SANDBOX_DIR}/.venv',
+        '--ro-bind', str(root / 'sandbox_runner.py'), f'{SANDBOX_DIR}/sandbox_runner.py',
+        '--ro-bind', str(root / 'sandbox_framing.py'), f'{SANDBOX_DIR}/sandbox_framing.py',
+        '--ro-bind', str(root / 'event.py'), f'{SANDBOX_DIR}/event.py',
+        '--chdir', SANDBOX_DIR,
+        # NOTE: no resource limits here — bubblewrap has no --rlimit-* options.
+        # CPU/memory/fd/process ceilings are applied *inside* the sandbox by
+        # sandbox_runner.py via resource.setrlimit() (soft == hard, so the
+        # untrusted script cannot raise them), and the host additionally enforces
+        # a wall-clock timeout (SANDBOX_TIMEOUT) and kills the child.
+        # The interpreter is invoked at its BOUND location (/app/.venv/...), not
+        # the host path — the venv dir is mounted read-only at SANDBOX_DIR.
+        f'{SANDBOX_DIR}/.venv/bin/python3', f'{SANDBOX_DIR}/sandbox_runner.py',
+    ]
+
+    usable, reason = _bwrap_preflight(argv)
+    if not usable:
+        if required:
+            return None, reason
+        # auto mode: fall back to in-process, but say so loudly — a silent
+        # downgrade would leave scripts running unsandboxed without anyone
+        # noticing.
+        print(f'[sandbox] {reason} — running scripts in-process (unsandboxed). '
+              'Set SCRIPT_SANDBOX=1 to make this fatal.')
+        return None, ''
+    return argv, ''
+
+
+def _event_payload(event: Event) -> dict:
+    """JSON-safe copy of the Event for the sandbox (datetimes become ISO)."""
+    data = asdict(event)
+    for key in ('start_date', 'end_date'):
+        value = data.get(key)
+        if hasattr(value, 'isoformat'):
+            data[key] = value.isoformat()
+    return data
+
+
+async def _run_sandboxed(page, script: Script, event: Event, argv) -> tuple[bool, str]:
+    """Run the script inside bwrap, serving it the driver tools over stdio."""
+    # Imported lazily: sandbox_host imports Driver from this module.
+    from sandbox_host import SandboxHost
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        return False, f'could not start the sandbox: {exc}'
+
+    host = SandboxHost(page, _event_payload(event), script.code)
+    stderr_lines: list[str] = []
+
+    async def drain_stderr():
+        # Must be drained concurrently: a full stderr pipe would block the child.
+        while True:
+            try:
+                line = await proc.stderr.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            text = line.decode('utf-8', 'replace').rstrip()
+            if text:
+                print(f'[sandbox] {text}')
+                stderr_lines.append(text)
+                del stderr_lines[:-40]  # keep a bounded tail
+
+    drain = asyncio.create_task(drain_stderr())
+    timed_out = False
+    transport_error = ''
+    killed_by_us = False
+    try:
+        await asyncio.wait_for(host.serve_child(proc), timeout=SANDBOX_TIMEOUT)
+    except asyncio.TimeoutError:
+        timed_out = True
+    except Exception as exc:
+        transport_error = f'{type(exc).__name__}: {exc}'
+    finally:
+        with contextlib.suppress(Exception):
+            if proc.returncode is None:
+                # The bridge finished while the child was still alive: we are
+                # about to SIGKILL it, so the exit status below (137) is OUR
+                # doing — do not report it as the sandbox dying on its own.
+                killed_by_us = True
+                proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), 10)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(drain, 5)
+
+    tail = '\n'.join(stderr_lines[-12:])
+    # Anything that went wrong before the client fetched its job is an infra
+    # failure (bwrap/env), not a bug in the generated script — the code never
+    # ran. The marker MUST be at the very start of the message: callers test
+    # `msg.startswith(SANDBOX_ERROR_PREFIX)` and otherwise hand the failure to
+    # the LLM as a script bug (burning rewrite attempts on a broken sandbox).
+    infra = not host.started
+    marker = SANDBOX_ERROR_PREFIX + ' ' if infra else ''
+    exit_desc = _describe_exit(proc.returncode)
+
+    if timed_out:
+        body = f'sandboxed script timed out after {SANDBOX_TIMEOUT:g}s'
+    elif transport_error:
+        body = f'sandbox bridge error: {transport_error}'
+    else:
+        result = host.result
+        if result is not None and result.get('ok'):
+            return True, 'executed'
+        if result is not None:
+            return False, (str(result.get('error') or 'script failed')
+                           + (f'\n{tail}' if tail else ''))
+        if killed_by_us:
+            body = ('the sandbox bridge stopped before the script finished '
+                    '(the runner was still alive and had to be killed)')
+        else:
+            body = (f'the sandboxed runner exited without reporting a result '
+                    f'({exit_desc})')
+        if host.bridge_error:
+            body += f'; bridge error: {host.bridge_error}'
+        if infra:
+            if _is_sigkill(proc.returncode) and not killed_by_us:
+                body += ('; SIGKILL with no traceback usually means the kernel killed '
+                         'the sandbox (out of memory). Try SANDBOX_CLIENT=mcp, lower '
+                         'SANDBOX_MAX_MEMORY_MB, or SCRIPT_SANDBOX=0 to compare with '
+                         'the in-process path')
+            body += ('; check `bwrap`, SCRIPT_SANDBOX and SANDBOX_TIMEOUT, or run '
+                     '`python3 tools/sandbox_smoke.py` on this machine')
+
+    if infra:
+        # Surface the command + whatever the sandbox said, so the failure is
+        # diagnosable without re-running with extra logging.
+        print(f'[sandbox] run failed ({exit_desc}) — command was:')
+        print('  ' + ' '.join(argv))
+        if tail:
+            print(f'[sandbox] stderr tail:\n{tail}')
+    return False, marker + body + (f'\n{tail}' if tail else '')

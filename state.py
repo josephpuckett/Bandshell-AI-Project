@@ -46,6 +46,28 @@ BROWSER_FPS = min(max(BROWSER_FPS, 1.0), 60.0)
 BROWSER_JPEG_QUALITY = int(os.getenv("BROWSER_JPEG_QUALITY", "80") or 80)
 BROWSER_JPEG_QUALITY = min(max(BROWSER_JPEG_QUALITY, 30), 95)
 
+# --- Sandboxed script execution (bubblewrap) ---
+# Generated scripts are untrusted (a malicious page can steer the agent into
+# writing them), so they run inside bwrap with no network, no host filesystem
+# and a scrubbed environment — see docs/sandbox-plan.md.
+#   auto (default): sandbox when bwrap is installed, else in-process
+#   1/on/require:   require bwrap (a missing bwrap fails the run loudly)
+#   0/off:          always use the in-process executor (dev fallback)
+SCRIPT_SANDBOX = (os.getenv("SCRIPT_SANDBOX") or "auto").strip().lower()
+# bwrap binary (override for a non-PATH install).
+BWRAP = os.getenv("BWRAP") or "bwrap"
+# Wall-clock cap on one sandboxed run; the child is killed when it expires.
+SANDBOX_TIMEOUT = float(os.getenv("SANDBOX_TIMEOUT", "120") or 120)
+# Resource ceilings applied INSIDE the sandbox by sandbox_runner.py (bubblewrap
+# has no --rlimit-* options). A runaway script's memory is host memory, so the
+# address-space cap is what protects a small VM; it is passed in via --setenv.
+SANDBOX_CPU_SECONDS = int(os.getenv("SANDBOX_CPU_SECONDS", "30") or 30)
+SANDBOX_MAX_MEMORY_MB = int(os.getenv("SANDBOX_MAX_MEMORY_MB", "1024") or 1024)
+# Which MCP client the sandboxed runner uses: auto (fastmcp if importable, else
+# the mcp SDK), fastmcp, or mcp. `mcp` is the lighter path — on a 1GB VM the
+# fastmcp import can be the peak-memory moment of a run (SIGKILL/exit 137).
+SANDBOX_CLIENT = (os.getenv("SANDBOX_CLIENT") or "auto").strip().lower()
+
 # --- The mounted browser MCP agent (Bot drives Playwright through this) ---
 parent = FastMCP("parent")
 parent.mount(browser_mcp)

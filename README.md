@@ -46,6 +46,10 @@ guided setup.
 | `BROWSER_FPS` | Live-view target frame rate (default `4`, max `60`). A ceiling — the actual rate is bounded by the CDP/screenshot pipeline and the VM's CPU; unchanged frames are deduped anyway |
 | `BROWSER_JPEG_QUALITY` | Live-view JPEG quality (default `80`, range 30–95). Lower = faster encode + smaller frames (the encode is the CPU floor on small VMs); a small visual cost in the watching view |
 | `EVENTBRITE_TOKEN` | Enables Eventbrite API websites (draft events, no publishing) |
+| `SCRIPT_SANDBOX` | Script isolation: `auto` (default — bubblewrap when installed, else in-process), `1`/`require` (require bwrap), `0` (always in-process). Install with `apt-get install bubblewrap` |
+| `BWRAP` / `SANDBOX_TIMEOUT` | bwrap binary path (default `bwrap`) / per-run wall-clock limit in seconds (default 120) |
+| `SANDBOX_CLIENT` | MCP client used *inside* the sandbox: `auto` (default — fastmcp if it imports, else the `mcp` SDK), `fastmcp`, or `mcp` (lightest; use if sandboxed runs die with `exit 137`) |
+| `SANDBOX_CPU_SECONDS` / `SANDBOX_MAX_MEMORY_MB` | Per-run ceilings applied inside the sandbox (default 30 s / 1024 MB) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` + `EVENTS_SPREADSHEET_ID` | Google Sheets persistence (Events / Websites / Settings worksheets) |
 
 (The browser engine is set via the `BROWSER` env var, default `chromium`.)
@@ -85,7 +89,8 @@ per restart — consider a static domain for anything persistent.
 | `agents.py` | Agent orchestration state machines (`run_onboarding`, `run_task`) |
 | `bot.py` | LLM client (OpenRouter/OpenAI-compatible) with tool-call loop + retry/fallback handling |
 | `browser.py` | Playwright manager + the browser tools the agent calls |
-| `scripting.py` | Script validation (AST allowlist) and in-process execution (`Driver`) |
+| `scripting.py` | Script validation (AST allowlist) and execution (`Driver`; runs in a bubblewrap sandbox when available) |
+| `sandbox_framing.py` `sandbox_host.py` `sandbox_runner.py` | Script sandbox: MCP-stdio framing, host-side driver server, sandbox-side runner |
 | `scripter.py` | Prompt builders + code-extraction helpers |
 | `event.py` `settings.py` `website.py` `task.py` | Dataclasses |
 | `eventbrite_api.py` | Eventbrite API client (drafts, image upload) |
@@ -93,14 +98,22 @@ per restart — consider a static domain for anything persistent.
 | `serialization.py` | Dataclass ↔ API-dict conversion, settings-version hashing |
 | `frontend/` | Static UI (`index.html`, `app.js`, `style.css`) |
 | `logs/` | Runtime LLM usage + per-run transcripts (JSONL, gitignored) |
+| `tools/sandbox_smoke.py` | Smoke test for the bwrap + MCP-stdio sandbox bridge (no browser needed) |
 
 ## Key behavior notes
 
 - **Scripts are gated by `validate_script()`** — an AST walk that rejects imports,
   disallowed calls, and dangerous patterns before any script executes. This is the defense
   against prompt/code injection (a malicious calendar site steering the agent toward
-  malicious code). Future: run scripts in a sandboxed subprocess; the tight `Driver` API is
-  designed so that swap is confined to the execution layer.
+  malicious code).
+- **Scripts then run inside a bubblewrap sandbox** (when `bwrap` is installed): no network,
+  no host filesystem (an empty tmpfs root plus a read-only whitelist of `/usr`, the venv and
+  three project files), no API keys in the environment, and CPU/memory/fd ceilings applied by
+  the runner itself (`resource.setrlimit`, soft == hard). The only thing the script can touch
+  is the 11 allowlisted `api.*` operations, which are served by the host over MCP-stdio and
+  drive the same review page you are watching. `SCRIPT_SANDBOX` controls it (`auto` = use
+  bwrap if it passes a one-time preflight, `0` = in-process fallback, `1` = require it).
+  See `docs/sandbox-plan.md`.
 - **Settings versioning:** generated scripts record a hash of the *global* settings they
   were built against (venue, location, cost, categories, timezone, Eventbrite IDs). Changing
   those marks a scripted website **stale** and it must be re-onboarded — scripts take those
