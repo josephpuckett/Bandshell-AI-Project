@@ -11,6 +11,7 @@ For now scripts run in-process. Later this may move behind a sandbox
 import ast
 import asyncio
 import contextlib
+import os
 import shutil
 import signal
 import subprocess
@@ -374,6 +375,38 @@ def _sandbox_argv():
             return None, f'SCRIPT_SANDBOX={SCRIPT_SANDBOX} but {python} is missing'
         return None, ''
 
+    # The interpreter may not live under /usr: `uv sync` downloads a managed
+    # CPython (e.g. ~/.local/share/uv/python/cpython-3.12.x-.../bin/python3.12)
+    # when the distro ships an older Python. The venv's python is a symlink to
+    # it, so bind that interpreter prefix too — at the same absolute path, so
+    # the symlink still resolves inside the sandbox. (Without this, Debian 12 +
+    # uv-managed 3.12 fails with "execvp /app/.venv/bin/python3: No such file".)
+    extra_binds: list[str] = []
+    seen_prefixes = {str(venv)}
+    hop = python
+    try:
+        # Walk the venv's symlink chain (python3 -> python -> <prefix>/bin/python3.x)
+        # and bind every non-/usr prefix *as written*, because a chain can hop
+        # through version-less directory names (uv: cpython-3.12-... -> 3.12.15-...).
+        for _ in range(10):
+            try:
+                target = Path(os.readlink(hop))
+            except OSError:
+                break                       # real file: end of chain
+            if not target.is_absolute():
+                target = hop.parent / target
+            candidates = [target.parent.parent]
+            with contextlib.suppress(Exception):
+                candidates.append(hop.resolve().parent.parent)
+            for prefix in candidates:
+                text = str(prefix)
+                if not text.startswith('/usr') and text not in seen_prefixes:
+                    seen_prefixes.add(text)
+                    extra_binds += ['--ro-bind', text, text]
+            hop = target
+    except Exception:
+        pass
+
     # Only the files the runner actually needs are bound read-only: the venv,
     # the runner, the framing helper and the Event dataclass. The rest of the
     # repo (logs/, generated/, sheets creds, etc.) is invisible.
@@ -403,6 +436,7 @@ def _sandbox_argv():
         '--dev', '/dev',
         '--tmpfs', '/tmp',
         # The whitelisted project files.
+        *extra_binds,
         '--ro-bind', str(venv), f'{SANDBOX_DIR}/.venv',
         '--ro-bind', str(root / 'sandbox_runner.py'), f'{SANDBOX_DIR}/sandbox_runner.py',
         '--ro-bind', str(root / 'sandbox_framing.py'), f'{SANDBOX_DIR}/sandbox_framing.py',
