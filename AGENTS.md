@@ -390,6 +390,12 @@ main.py       <- depends on everything; imports agents/serialization/state
 
 - `.venv` is gitignored. The venv symlinks point at `/usr/bin/python3.12` — that interpreter
   must be where dev runs.
+- **On a server, env vars come from `/etc/bandshell/bandshell.env`**, loaded by the
+  systemd unit's `EnvironmentFile=`. systemd does not inherit a shell, and a `.env`
+  file in the repo is *not* read (everything goes through `os.getenv()` at import
+  time). `GET /api/health` reports booleans only (`llm_configured`,
+  `eventbrite_configured`, `storage_backend`, `sandbox_mode`, ...) — use it to confirm
+  the running process picked the values up without ever echoing secrets.
 - `OPENROUTER_API_KEY` is read from the env at import time in `state.py`:
   `TOKEN = os.getenv("OPENROUTER_API_KEY")`. The token should NOT be committed.
 - `EVENTBRITE_TOKEN` is read in `state.py` too, used only server-side by `eventbrite_api.py`.

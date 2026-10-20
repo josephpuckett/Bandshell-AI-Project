@@ -5,6 +5,8 @@ modules; see `state`, `agents`, `scripting`, `scripter`, `serialization`.
 """
 import asyncio
 import json
+import os
+import shutil
 from base64 import b64encode
 from contextlib import asynccontextmanager
 from dataclasses import asdict, fields
@@ -23,6 +25,7 @@ from event import Event
 from serialization import (asset_url, current_settings_version, event_out,
                            task_out, website_out, _parse_event_id)
 from settings import Settings
+import state
 from state import (BROWSER_FPS, BROWSER_JPEG_QUALITY, FRONTEND, events,
                    input_queues, runners, settings, tasks, website_queues,
                    website_runners, websites)
@@ -86,6 +89,32 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ----------------------------- Health ----------------------------------------
+@app.get('/api/health')
+async def health():
+    """Liveness + which optional integrations THIS process can see.
+
+    Reports booleans only (never the values), so it is safe to expose and is the
+    quickest way to answer "did my environment file actually load?" — env vars
+    are read with os.getenv() at import time, so a shell export or a .env file in
+    the repo has no effect on the systemd service.
+    """
+    return {
+        'ok': True,
+        'llm_configured': bool(state.TOKEN),
+        'llm_model': state.MODEL if state.TOKEN else None,
+        'llm_fallbacks': len(state.FALLBACK_MODELS),
+        'eventbrite_configured': bool(eventbrite_api.EVENTBRITE_TOKEN),
+        'storage_backend': storage.backend,
+        'sandbox_mode': state.SCRIPT_SANDBOX,
+        'sandbox_bwrap_on_path': bool(shutil.which(state.BWRAP)),
+        'headless': os.getenv('HEADLESS') == '1',
+        'browser_engine': os.getenv('BROWSER') or 'chromium',
+        'events': len(events),
+        'websites': len(websites),
+    }
 
 
 # ----------------------------- Settings --------------------------------------

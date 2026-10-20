@@ -65,6 +65,27 @@ loopback. Put secrets in `/etc/bandshell/bandshell.env`.
 sudo bash deploy/install.sh --auth-user you --nginx-port 8080
 ```
 
+**Environment variables go in `/etc/bandshell/bandshell.env`** (created by the
+installer, mode 600). It is read by the systemd unit — systemd does *not* inherit
+your shell, and a `.env` file in the repo is not read, because the app uses
+`os.getenv()` at import time. Format is literal `KEY=VALUE` lines:
+
+```ini
+OPENROUTER_API_KEY=sk-or-v1-...
+HEADLESS=1
+SCRIPT_SANDBOX=1
+```
+
+Then `sudo systemctl restart bandshell`. To check what the running process
+actually sees:
+
+```bash
+curl -s http://127.0.0.1:8000/api/health
+# {"ok":true,"llm_configured":true,"storage_backend":"MemoryStorage",...}
+```
+
+`/api/health` reports booleans only (never values), so it is safe to expose.
+
 ### Serving externally
 
 The embedded live browser view uses a WebSocket (`/api/browser/{id}/ws`), so a reverse

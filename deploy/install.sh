@@ -39,7 +39,8 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-8000}"                 # uvicorn (loopback only)
+NGINX_PORT="${NGINX_PORT:-8080}"     # nginx listen port (firewall/tunnel target)
 SERVER_NAME="${SERVER_NAME:-_}"      # nginx server_name; "_" = catch-all
 SITE_NAME="${SITE_NAME:-bandshell}"
 DOMAIN="${DOMAIN:-}"                 # set → configure certbot TLS for this name
@@ -123,6 +124,7 @@ if [ "$AUTH_ENABLED" = "0" ] && [ "$AUTH_PASS_EXPLICIT" = "1" ]; then
     die "--no-auth conflicts with --auth-pass/AUTH_PASSWORD"
 fi
 HTPASSWD_FILE="/etc/nginx/${SITE_NAME}.htpasswd"
+ENV_FILE="/etc/bandshell/bandshell.env"
 LIMIT_ZONE="${SITE_NAME//-/_}_cost"
 PROXY_SNIPPET="/etc/nginx/snippets/${SITE_NAME}-proxy.conf"
 
@@ -407,6 +409,53 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# 5b. Environment file (secrets & settings for the service)
+# --------------------------------------------------------------------------- #
+step "Environment file"
+install -d -m 0755 /etc/bandshell
+# Create the environment file rather than just nagging about it. systemd does
+# NOT inherit the shell you ran this script from, and the app reads os.getenv()
+# at import time — so this file is the ONLY place the service picks values up
+# from. (A .env file in the repo is not read.)
+if [ ! -f "$ENV_FILE" ]; then
+    cat >"$ENV_FILE" <<'ENVEOF'
+# Bandshell Calendar — read by the systemd unit (EnvironmentFile=).
+#
+# Format: KEY=VALUE, one per line. NOTE: this is NOT a shell script — do not use
+# `export`, quotes, or $VAR expansion; systemd takes the text literally.
+#
+# Required for any AI action:
+# OPENROUTER_API_KEY=sk-or-v1-...
+#
+# Optional:
+# OPENROUTER_FALLBACK_MODELS=openai/gpt-4o-mini,mistralai/mistral-small-3.1-24b-instruct
+# EVENTBRITE_TOKEN=
+# GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account", ...}    # inline JSON or a path
+# EVENTS_SPREADSHEET_ID=
+# SCRIPT_SANDBOX=1          # auto|1|0 — 1 makes a broken sandbox fail loudly
+# SANDBOX_TIMEOUT=120
+# HEADLESS=1
+# BROWSER=chromium
+# BROWSER_FPS=4
+# BROWSER_JPEG_QUALITY=80
+ENVEOF
+    # Tolerate a non-root run (e.g. local testing); the mode is the important bit.
+    chown root:root "$ENV_FILE" 2>/dev/null || true
+    chmod 600 "$ENV_FILE" || warn "could not chmod 600 $ENV_FILE"
+    ok "created $ENV_FILE (mode 600) — put OPENROUTER_API_KEY in it"
+fi
+
+# Did the caller export keys in their shell, expecting the service to see them?
+if [ -n "${OPENROUTER_API_KEY:-}" ] && ! grep -qE "^[[:space:]]*OPENROUTER_API_KEY=[^[:space:]#]" "$ENV_FILE"; then
+    warn "OPENROUTER_API_KEY is set in YOUR shell, but systemd does not inherit it."
+    warn "  Put it in $ENV_FILE instead, then: sudo systemctl restart bandshell"
+fi
+if ! grep -qE "^[[:space:]]*OPENROUTER_API_KEY=[^[:space:]#]" "$ENV_FILE"; then
+    warn "$ENV_FILE has no OPENROUTER_API_KEY yet — the UI will load,"
+    warn "  but every AI action (onboarding) will fail until you add it."
+fi
+
+# --------------------------------------------------------------------------- #
 # 6. systemd service
 # --------------------------------------------------------------------------- #
 if [ "$INSTALL_SERVICE" = "1" ]; then
@@ -456,12 +505,6 @@ UNIT
     systemctl enable bandshell.service >/dev/null
     ok "bandshell.service enabled (starts on boot)"
 
-    if [ ! -f /etc/bandshell/bandshell.env ]; then
-        warn "no /etc/bandshell/bandshell.env yet — create it (chmod 600) before starting:"
-        warn "    OPENROUTER_API_KEY=sk-or-..."
-        warn "    # optional: EVENTBRITE_TOKEN=..., GOOGLE_SERVICE_ACCOUNT_JSON=...,"
-        warn "    #           EVENTS_SPREADSHEET_ID=..., SCRIPT_SANDBOX=1"
-    fi
     systemctl restart bandshell.service || true
 fi
 
@@ -531,6 +574,20 @@ if [ "$INSTALL_SERVICE" = "1" ] && systemctl is-active --quiet bandshell; then
     done
     if [ "$healthy" = "1" ]; then
         ok "service is up and answering on 127.0.0.1:${PORT} (HTTP $code)"
+        # Ask the process what it can actually see (booleans only — no secrets).
+        hjson="$(curl -s --max-time 3 "http://127.0.0.1:${PORT}/api/health" 2>/dev/null || true)"
+        if [ -n "$hjson" ]; then
+            llm="$(printf '%s' "$hjson" | (jq -r '.llm_configured' 2>/dev/null || echo unknown))"
+            stor="$(printf '%s' "$hjson" | (jq -r '.storage_backend' 2>/dev/null || echo unknown))"
+            sbx="$(printf '%s' "$hjson" | (jq -r '.sandbox_mode' 2>/dev/null || echo unknown))"
+            if [ "$llm" = "true" ]; then
+                ok "the running service sees OPENROUTER_API_KEY (llm_configured=true)"
+            elif [ "$llm" = "false" ]; then
+                warn "the service does NOT see OPENROUTER_API_KEY — AI actions will fail."
+                warn "  add it to $ENV_FILE, then: sudo systemctl restart bandshell"
+            fi
+            ok "reported: storage=${stor} sandbox=${sbx}"
+        fi
     else
         warn "service is running but not answering yet (HTTP $code) — check: journalctl -u bandshell -n 60"
     fi
@@ -577,8 +634,11 @@ fi
 cat <<SUMMARY
 
 Next steps:
-  1. Create /etc/bandshell/bandshell.env (chmod 600) with at least
-     OPENROUTER_API_KEY=... . Then: sudo systemctl restart bandshell
+  1. Put secrets in ${ENV_FILE} (mode 600, KEY=VALUE lines — NOT a shell script,
+     no 'export', no quoting). systemd does not inherit your shell environment, so a
+     shell export or a .env file in the repo has no effect on the service.
+     Then: sudo systemctl restart bandshell
+     Check what the process sees: curl -s http://127.0.0.1:${PORT}/api/health
   2. Open port ${NGINX_PORT} (and 443 if you use TLS) in the cloud firewall — nginx is the
      only public entry point; uvicorn itself listens on loopback only.
      Point any tunnel (ngrok/cloudflared) at nginx (http://127.0.0.1:${NGINX_PORT}), NEVER
