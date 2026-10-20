@@ -16,10 +16,17 @@
 # which the systemd unit loads (OPENROUTER_API_KEY, EVENTBRITE_TOKEN,
 # GOOGLE_SERVICE_ACCOUNT_JSON, EVENTS_SPREADSHEET_ID, ...).
 #
+# Authentication: nginx HTTP Basic auth is ON by default (the app itself has no
+# login). Anyone with the URL could otherwise read your events, spend your
+# OpenRouter credit and drive the server's browser. Rotate with:
+#     sudo htpasswd /etc/nginx/<site>.htpasswd <user>
+#
 # Usage:
 #   sudo bash deploy/install.sh                 # defaults: this script's repo dir
+#   sudo bash deploy/install.sh --auth-user steve     # prompted for a password
 #   sudo bash deploy/install.sh --port 8080
 #   sudo bash deploy/install.sh --domain events.example.org --email you@example.org
+#   sudo bash deploy/install.sh --no-auth       # NOT recommended; warns loudly
 #   sudo bash deploy/install.sh --no-service --no-sandbox-test
 #
 # Assumes the project is already cloned (you said you'd handle that).
@@ -37,6 +44,10 @@ SITE_NAME="${SITE_NAME:-bandshell}"
 DOMAIN="${DOMAIN:-}"                 # set → configure certbot TLS for this name
 EMAIL="${EMAIL:-}"                   # required with DOMAIN
 APP_USER="${APP_USER:-}"             # default: owner of the project directory
+AUTH_ENABLED=1                       # nginx basic auth (strongly recommended)
+AUTH_USER="${AUTH_USER:-bandshell}"  # login name
+AUTH_PASS="${AUTH_PASS:-}"           # password (else prompted, or auto-generated)
+AUTH_PASS_EXPLICIT=0                 # 1 when supplied via flag/env
 INSTALL_SERVICE="${INSTALL_SERVICE:-1}"
 RUN_SANDBOX_TEST="${RUN_SANDBOX_TEST:-1}"
 BROWSER_CHANNEL="chromium"
@@ -52,7 +63,12 @@ ok()   { printf '%s  ok%s %s\n' "$c_green" "$c_reset" "$*"; }
 warn() { printf '%s  !!%s %s\n' "$c_yellow" "$c_reset" "$*" >&2; }
 die()  { printf '%s error:%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
+# Print the leading comment block as --help text (self-maintaining: stops at the
+# first non-comment line, so editing the header can't truncate the help).
+usage() {
+    awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"
+    exit 0
+}
 
 # --------------------------------------------------------------------------- #
 # Argument parsing
@@ -66,6 +82,9 @@ while [ $# -gt 0 ]; do
         --email)          EMAIL="${2:?}"; shift 2 ;;
         --user)           APP_USER="${2:?}"; shift 2 ;;
         --site-name)      SITE_NAME="${2:?}"; shift 2 ;;
+        --auth-user)      AUTH_USER="${2:?}"; shift 2 ;;
+        --auth-pass)      AUTH_PASS="${2:?}"; AUTH_PASS_EXPLICIT=1; shift 2 ;;
+        --no-auth)        AUTH_ENABLED=0; shift ;;
         --no-service)     INSTALL_SERVICE=0; shift ;;
         --no-sandbox-test) RUN_SANDBOX_TEST=0; shift ;;
         -h|--help)        usage ;;
@@ -94,6 +113,16 @@ fi
 if [ -n "$DOMAIN" ] && [ -z "$EMAIL" ]; then
     die "--domain needs --email (for certbot registration)"
 fi
+
+if [ -n "${AUTH_PASSWORD:-}" ] && [ -z "$AUTH_PASS" ]; then
+    AUTH_PASS="$AUTH_PASSWORD"; AUTH_PASS_EXPLICIT=1
+fi
+if [ "$AUTH_ENABLED" = "0" ] && [ "$AUTH_PASS_EXPLICIT" = "1" ]; then
+    die "--no-auth conflicts with --auth-pass/AUTH_PASSWORD"
+fi
+HTPASSWD_FILE="/etc/nginx/${SITE_NAME}.htpasswd"
+LIMIT_ZONE="${SITE_NAME//-/_}_cost"
+PROXY_SNIPPET="/etc/nginx/snippets/${SITE_NAME}-proxy.conf"
 
 as_user() { sudo -u "$APP_USER" -H -- "$@"; }
 
@@ -180,6 +209,95 @@ if [ -n "$DOMAIN" ]; then
     SERVER_NAME="$DOMAIN"
 fi
 
+# --- credentials ----------------------------------------------------------- #
+if [ "$AUTH_ENABLED" = "1" ]; then
+    step "Configuring web login (HTTP Basic auth)"
+    apt-get install -y -qq apache2-utils >/dev/null
+
+    # Reuse existing credentials when the user is already in the file and no new
+    # password was supplied, so re-running the installer doesn't silently
+    # change (and lock people out of) a working password.
+    existing=0
+    if [ -f "$HTPASSWD_FILE" ] && grep -q "^${AUTH_USER}:" "$HTPASSWD_FILE"; then
+        existing=1
+    fi
+
+    if [ -z "$AUTH_PASS" ] && [ "$existing" = "1" ]; then
+        ok "keeping the existing password for user '$AUTH_USER' in $HTPASSWD_FILE"
+    else
+        if [ -z "$AUTH_PASS" ]; then
+            if [ -t 0 ] && [ -t 2 ]; then
+                while :; do
+                    printf '  Password for web login (%s): ' "$AUTH_USER" >&2
+                    read -rs AUTH_PASS; printf '\n' >&2
+                    printf '  Repeat password: ' >&2
+                    read -rs confirm; printf '\n' >&2
+                    [ "$AUTH_PASS" = "$confirm" ] && [ -n "$AUTH_PASS" ] && break
+                    warn "passwords did not match (or were empty) — try again"
+                done
+            else
+                # Non-interactive install: generate one and show it exactly once.
+                AUTH_PASS="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | cut -c1-20)"
+                AUTH_GENERATED=1
+            fi
+        fi
+        [ -n "$AUTH_PASS" ] || die "empty password"
+        if [ -f "$HTPASSWD_FILE" ]; then
+            printf '%s\n' "$AUTH_PASS" | htpasswd -i "$HTPASSWD_FILE" "$AUTH_USER" >/dev/null
+        else
+            printf '%s\n' "$AUTH_PASS" | htpasswd -i -c "$HTPASSWD_FILE" "$AUTH_USER" >/dev/null
+        fi
+        chown root:www-data "$HTPASSWD_FILE" 2>/dev/null || true
+        chmod 640 "$HTPASSWD_FILE"
+        ok "web login configured for user '$AUTH_USER' (file: $HTPASSWD_FILE)"
+    fi
+
+    # The file has to exist before nginx starts serving this site.
+    [ -s "$HTPASSWD_FILE" ] || die "missing $HTPASSWD_FILE"
+    if [ -z "$DOMAIN" ]; then
+        warn "Basic auth over plain HTTP sends the password in clear text."
+        warn "Use --domain <name> (TLS via certbot) or a tunnel for anything public."
+    fi
+else
+    warn "=============================================================="
+    warn " Running WITHOUT authentication (--no-auth)."
+    warn " Anyone who reaches this host can read your events/settings,"
+    warn " spend your OpenRouter credit, drive the browser, and create"
+    warn " Eventbrite drafts. Only do this on a private network."
+    warn "=============================================================="
+fi
+
+# --- shared proxy settings (included by both locations) -------------------- #
+install -d -m 0755 /etc/nginx/snippets
+{
+    printf '%s\n' "# Managed by Bandshell Calendar deploy/install.sh — shared proxy settings."
+    printf '%s\n' "proxy_pass http://127.0.0.1:${PORT};"
+    printf '%s\n' "proxy_http_version 1.1;"
+    printf '%s\n' "proxy_set_header Host              \$host;"
+    printf '%s\n' "proxy_set_header X-Real-IP         \$remote_addr;"
+    printf '%s\n' "proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+    printf '%s\n' "proxy_set_header X-Forwarded-Proto \$scheme;"
+    printf '%s\n' ""
+    printf '%s\n' "# WebSocket pass-through (the live browser view)."
+    printf '%s\n' "proxy_set_header Upgrade    \$http_upgrade;"
+    printf '%s\n' "proxy_set_header Connection \$connection_upgrade;"
+    printf '%s\n' ""
+    printf '%s\n' "# Stream frames straight through instead of buffering them."
+    printf '%s\n' "proxy_buffering off;"
+    printf '%s\n' ""
+    printf '%s\n' "# Long-lived streams: an onboarding/review session can idle for a while."
+    printf '%s\n' "proxy_read_timeout 3600s;"
+    printf '%s\n' "proxy_send_timeout 3600s;"
+    if [ "$AUTH_ENABLED" = "1" ]; then
+        printf '%s\n' ""
+        printf '%s\n' "# The app has no login of its own — protect every route, including the"
+        printf '%s\n' "# WebSocket upgrade (browsers replay cached credentials on it)."
+        printf '%s\n' "auth_basic           \"Bandshell Calendar\";"
+        printf '%s\n' "auth_basic_user_file ${HTPASSWD_FILE};"
+    fi
+} >"$PROXY_SNIPPET"
+
+# --- site ------------------------------------------------------------------ #
 cat >"$NGINX_CONF" <<NGINX
 # Managed by Bandshell Calendar deploy/install.sh — re-run the script to update.
 #
@@ -191,6 +309,10 @@ map \$http_upgrade \$connection_upgrade {
     ''      close;
 }
 
+# Throttle the endpoints that spend money / take over the browser, so a stolen
+# password (or a bored visitor) can't queue up expensive agent runs.
+limit_req_zone \$binary_remote_addr zone=${LIMIT_ZONE}:10m rate=6r/m;
+
 server {
     listen 80;
     listen [::]:80;
@@ -200,24 +322,15 @@ server {
     client_max_body_size 8m;
 
     location / {
-        proxy_pass http://127.0.0.1:${PORT};
-        proxy_http_version 1.1;
+        include ${PROXY_SNIPPET};
+    }
 
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        # WebSocket pass-through (the live browser view).
-        proxy_set_header Upgrade    \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        # Stream frames straight through instead of buffering them.
-        proxy_buffering off;
-
-        # Long-lived streams: an onboarding/review session can idle for a while.
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
+    # Onboarding runs an LLM agent; /run drives the browser. Regex locations are
+    # matched before the prefix above, so these get the same proxy/auth settings
+    # plus the rate limit.
+    location ~ ^/api/websites/[^/]+/(onboard|run)\$ {
+        limit_req zone=${LIMIT_ZONE} burst=3 nodelay;
+        include ${PROXY_SNIPPET};
     }
 }
 NGINX
@@ -349,17 +462,20 @@ if [ "$RUN_SANDBOX_TEST" = "1" ] && [ -f "$APP_DIR/tools/sandbox_smoke.py" ]; th
 fi
 
 if [ "$INSTALL_SERVICE" = "1" ] && systemctl is-active --quiet bandshell; then
-    healthy=0
+    healthy=0; code="000"
     for _ in $(seq 1 20); do
-        if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/api/settings" >/dev/null 2>&1; then
-            healthy=1; break
-        fi
+        # 2xx = up; 401 = up AND protected by nginx basic auth (expected).
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+                "http://127.0.0.1:${PORT}/api/settings" 2>/dev/null || echo 000)"
+        case "$code" in
+            2*|401) healthy=1; break ;;
+        esac
         sleep 1
     done
     if [ "$healthy" = "1" ]; then
-        ok "service is up and answering on 127.0.0.1:${PORT}"
+        ok "service is up and answering on 127.0.0.1:${PORT} (HTTP $code)"
     else
-        warn "service is running but not answering yet — check: journalctl -u bandshell -n 60"
+        warn "service is running but not answering yet (HTTP $code) — check: journalctl -u bandshell -n 60"
     fi
 fi
 
@@ -375,6 +491,24 @@ $(printf '%sDone.%s' "$c_green" "$c_reset")
   nginx        /etc/nginx/sites-available/${SITE_NAME}.conf  →  127.0.0.1:${PORT}
 SUMMARY
 
+if [ "$AUTH_ENABLED" = "1" ]; then
+cat <<SUMMARY
+  login        HTTP Basic auth — user '$AUTH_USER'  ($HTPASSWD_FILE)
+SUMMARY
+    if [ "${AUTH_GENERATED:-0}" = "1" ]; then
+cat <<SUMMARY
+
+$(printf '%sGENERATED PASSWORD:%s %s' "$c_yellow" "$c_reset" "$AUTH_PASS")
+  Copy it now — it is not stored anywhere except as a hash in the htpasswd file.
+  Change it later with: sudo htpasswd $HTPASSWD_FILE $AUTH_USER
+SUMMARY
+    fi
+else
+cat <<SUMMARY
+  login        ${c_red}NONE${c_reset} — anyone who can reach this host has full access.
+SUMMARY
+fi
+
 if [ "$INSTALL_SERVICE" = "1" ]; then
 cat <<SUMMARY
   service      systemctl {status|restart|stop} bandshell
@@ -388,7 +522,8 @@ Next steps:
   1. Create /etc/bandshell/bandshell.env (chmod 600) with at least
      OPENROUTER_API_KEY=... . Then: sudo systemctl restart bandshell
   2. Open port 80 (and 443) in the cloud firewall — nginx is reachable from outside,
-     uvicorn itself only listens on loopback.
+     uvicorn itself only listens on loopback. The site then asks for the login above.
+  2b. Rotate the password any time: sudo htpasswd ${HTPASSWD_FILE} ${AUTH_USER}
   3. On a headless server keep HEADLESS=1 (already set in the unit).
   4. Script sandbox: install bubblewrap (done) and set SCRIPT_SANDBOX=1 so a broken
      sandbox fails loudly instead of silently running scripts unsandboxed.
