@@ -54,6 +54,17 @@ guided setup.
 
 (The browser engine is set via the `BROWSER` env var, default `chromium`.)
 
+### Deploying on a server (Debian/Ubuntu)
+
+`deploy/install.sh` provisions a host end to end: system packages, `uv`, the
+Python deps (from `uv.lock`), Playwright's Chromium, an nginx site with
+**HTTP Basic auth on by default**, and a systemd unit running uvicorn on
+loopback. Put secrets in `/etc/bandshell/bandshell.env`.
+
+```bash
+sudo bash deploy/install.sh --auth-user you --nginx-port 8080
+```
+
 ### Serving externally
 
 The embedded live browser view uses a WebSocket (`/api/browser/{id}/ws`), so a reverse

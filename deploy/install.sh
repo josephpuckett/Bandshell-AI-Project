@@ -24,7 +24,8 @@
 # Usage:
 #   sudo bash deploy/install.sh                 # defaults: this script's repo dir
 #   sudo bash deploy/install.sh --auth-user steve     # prompted for a password
-#   sudo bash deploy/install.sh --port 8080
+#   sudo bash deploy/install.sh --nginx-port 80       # default is 8080
+#   sudo bash deploy/install.sh --port 9000           # uvicorn port
 #   sudo bash deploy/install.sh --domain events.example.org --email you@example.org
 #   sudo bash deploy/install.sh --no-auth       # NOT recommended; warns loudly
 #   sudo bash deploy/install.sh --no-service --no-sandbox-test
@@ -77,6 +78,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --app-dir)        APP_DIR="${2:?}"; shift 2 ;;
         --port)           PORT="${2:?}"; shift 2 ;;
+        --nginx-port)     NGINX_PORT="${2:?}"; shift 2 ;;
         --server-name)    SERVER_NAME="${2:?}"; shift 2 ;;
         --domain)         DOMAIN="${2:?}"; shift 2 ;;
         --email)          EMAIL="${2:?}"; shift 2 ;;
@@ -314,8 +316,8 @@ map \$http_upgrade \$connection_upgrade {
 limit_req_zone \$binary_remote_addr zone=${LIMIT_ZONE}:10m rate=6r/m;
 
 server {
-    listen 80;
-    listen [::]:80;
+    listen ${NGINX_PORT};
+    listen [::]:${NGINX_PORT};
     server_name ${SERVER_NAME};
 
     # Far more than a browser tab needs; the JSON posts are tiny.
@@ -340,14 +342,69 @@ if [ -n "$DOMAIN" ]; then
         warn "could not install certbot; run it manually for TLS"
 fi
 ln -sfn "$NGINX_CONF" "/etc/nginx/sites-enabled/${SITE_NAME}.conf"
-# The distro default also claims "server_name _;" on :80 and would shadow us.
-if [ -L /etc/nginx/sites-enabled/default ]; then
+# The distro default claims "server_name _;" on :80 and would shadow us — but
+# only when we listen on :80 ourselves (on 8080 it's harmless, and a stray
+# welcome page there is better than nothing).
+if [ "$NGINX_PORT" = "80" ] && [ -L /etc/nginx/sites-enabled/default ]; then
     rm -f /etc/nginx/sites-enabled/default
     ok "disabled the default nginx site"
 fi
+# --------------------------------------------------------------------------- #
+# Detect configs that would shadow this one BEFORE reloading: a duplicate
+# `listen :PORT` makes the reload fail and leaves the OLD (unauthenticated)
+# site serving, which looks exactly like "the auth isn't being used".
+# --------------------------------------------------------------------------- #
+VERIFY_FAILED=0
+conflicts=""
+for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+    [ -e "$f" ] || continue
+    [ "$(readlink -f "$f")" = "$(readlink -f "$NGINX_CONF")" ] && continue
+    if grep -qsE "proxy_pass[[:space:]]+https?://(127\.0\.0\.1|localhost):${PORT}([^0-9]|$)" "$f" \
+       || grep -qsE "listen[[:space:]]+([0-9.\[\]*:)?${NGINX_PORT}([^0-9]|$)" "$f"; then
+        conflicts="$conflicts $f"
+    fi
+done
+if [ -n "$conflicts" ]; then
+    warn "these nginx configs shadow this site (same listen port, or proxying to"
+    warn "the app port ${PORT}) — they must go, or nginx will keep serving them:"
+    for f in $conflicts; do warn "    $f"; done
+    for f in $conflicts; do warn "    sudo rm -f $f && sudo systemctl reload nginx"; done
+    VERIFY_FAILED=1
+fi
+
 nginx -t -q || die "nginx config test failed (see $NGINX_CONF)"
-systemctl reload nginx 2>/dev/null || systemctl restart nginx
-ok "nginx serving ${SERVER_NAME} → 127.0.0.1:${PORT}"
+if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then
+    ok "nginx serving ${SERVER_NAME} on :${NGINX_PORT} → 127.0.0.1:${PORT}"
+else
+    warn "nginx FAILED to reload — the old config is still serving."
+    warn "  usually another block already listens on :${NGINX_PORT}:"
+    warn "    sudo nginx -t; sudo ss -ltnp | grep ':${NGINX_PORT}'"
+    VERIFY_FAILED=1
+fi
+
+# --------------------------------------------------------------------------- #
+# Verify the login is actually in force.
+# --------------------------------------------------------------------------- #
+if [ "$AUTH_ENABLED" = "1" ]; then
+    if [ "$SERVER_NAME" = "_" ]; then
+        probe_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+                      "http://127.0.0.1:${NGINX_PORT}/" 2>/dev/null || echo 000)"
+    else
+        probe_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+                      -H "Host: ${SERVER_NAME}" "http://127.0.0.1:${NGINX_PORT}/" 2>/dev/null || echo 000)"
+    fi
+    case "$probe_code" in
+        401) ok "verified: login is enforced (no credentials → HTTP 401)" ;;
+        200) warn "nginx served the app WITHOUT asking for a password (HTTP 200)!"
+             warn "  another server block is answering on :${NGINX_PORT}"
+             VERIFY_FAILED=1 ;;
+        *)   warn "could not verify the login through nginx (HTTP $probe_code)"
+             warn "  is nginx really listening on :${NGINX_PORT}? check: sudo ss -ltnp | grep ':${NGINX_PORT}'"
+             VERIFY_FAILED=1 ;;
+    esac
+else
+    warn "auth disabled (--no-auth): anything that reaches nginx gets full access"
+fi
 
 # --------------------------------------------------------------------------- #
 # 6. systemd service
@@ -488,7 +545,8 @@ $(printf '%sDone.%s' "$c_green" "$c_reset")
 
   project      $APP_DIR   (user: $APP_USER)
   venv         $APP_DIR/.venv  ($("$APP_DIR/.venv/bin/python" -V 2>&1))
-  nginx        /etc/nginx/sites-available/${SITE_NAME}.conf  →  127.0.0.1:${PORT}
+  nginx        /etc/nginx/sites-available/${SITE_NAME}.conf
+               listens on :${NGINX_PORT}  →  127.0.0.1:${PORT}
 SUMMARY
 
 if [ "$AUTH_ENABLED" = "1" ]; then
@@ -521,8 +579,10 @@ cat <<SUMMARY
 Next steps:
   1. Create /etc/bandshell/bandshell.env (chmod 600) with at least
      OPENROUTER_API_KEY=... . Then: sudo systemctl restart bandshell
-  2. Open port 80 (and 443) in the cloud firewall — nginx is reachable from outside,
-     uvicorn itself only listens on loopback. The site then asks for the login above.
+  2. Open port ${NGINX_PORT} (and 443 if you use TLS) in the cloud firewall — nginx is the
+     only public entry point; uvicorn itself listens on loopback only.
+     Point any tunnel (ngrok/cloudflared) at nginx (http://127.0.0.1:${NGINX_PORT}), NEVER
+     at 127.0.0.1:${PORT}: a tunnel straight to uvicorn skips nginx and the password.
   2b. Rotate the password any time: sudo htpasswd ${HTPASSWD_FILE} ${AUTH_USER}
   3. On a headless server keep HEADLESS=1 (already set in the unit).
   4. Script sandbox: install bubblewrap (done) and set SCRIPT_SANDBOX=1 so a broken
@@ -530,6 +590,17 @@ Next steps:
   5. Idle cost control: implement the inactivity watchdog (main.py) + a sudoers line
      for \`shutdown\`, or wire a Cloud Scheduler job to stop the instance.
 SUMMARY
+
+if [ "$VERIFY_FAILED" = "1" ]; then
+cat <<SUMMARY
+
+$(printf '%sWARNING:%s the login was NOT verified as enforced.' "$c_red" "$c_reset")
+  Diagnose with:
+    sudo nginx -T | grep -nE 'auth_basic|server_name|listen|proxy_pass'
+    sudo grep -rn "proxy_pass.*:${PORT}" /etc/nginx/
+    curl -sI http://127.0.0.1/api/settings        # expect: HTTP/1.1 401
+SUMMARY
+fi
 
 if [ -n "$DOMAIN" ]; then
 cat <<SUMMARY
@@ -540,7 +611,10 @@ cat <<SUMMARY
 SUMMARY
 fi
 
-if [ -n "$DOMAIN" ] && command -v certbot >/dev/null 2>&1; then
+if [ -n "$DOMAIN" ] && [ "$NGINX_PORT" != "80" ]; then
+    warn "certbot --nginx expects the site on :80 (HTTP-01 challenge + redirect)."
+    warn "Re-run with --nginx-port 80, or issue the cert manually (DNS challenge)."
+elif [ -n "$DOMAIN" ] && command -v certbot >/dev/null 2>&1; then
     step "Requesting TLS certificate"
     certbot --nginx -d "$DOMAIN" --redirect -m "$EMAIL" --agree-tos -n \
         && ok "https configured for $DOMAIN" \
