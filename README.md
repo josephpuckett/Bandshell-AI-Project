@@ -59,6 +59,10 @@ it does all of this, plus nginx, auth, and systemd.
 | `SANDBOX_CLIENT` | MCP client used *inside* the sandbox: `auto` (default — fastmcp if it imports, else the `mcp` SDK), `fastmcp`, or `mcp` (lightest; use if sandboxed runs die with `exit 137`) |
 | `SANDBOX_CPU_SECONDS` / `SANDBOX_MAX_MEMORY_MB` | Per-run ceilings applied inside the sandbox (default 30 s / 1024 MB) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` + `EVENTS_SPREADSHEET_ID` | Google Sheets persistence (Events / Websites / Settings worksheets) |
+| `AUTO_SHUTDOWN_MINUTES` | **Power the host off after this many idle minutes** (`0` = off, the default). The UI's 1s polls don't count as activity, so a forgotten tab can't keep a VM billing; fractions allowed (`0.5`) for testing |
+| `AUTO_SHUTDOWN_MAX_HOURS` | Escape hatch: power off after this much uptime even if work is in flight (`0` = never force) |
+| `AUTO_SHUTDOWN_DRY_RUN` | `1` logs the shutdown decision instead of powering off — watch the timer work |
+| `AUTO_SHUTDOWN_COMMAND` | What to run (default `sudo -n /usr/sbin/shutdown -h now`); the installer writes the matching sudoers rule |
 
 (The browser engine is set via the `BROWSER` env var, default `chromium`.)
 
@@ -108,6 +112,40 @@ port or proxies to the same uvicorn port, it names the file to remove before rel
 | rate limit | `6r/m` + burst 3 on the two endpoints that cost money (`…/onboard`, `…/run`) |
 | systemd | `bandshell.service`, `--workers 1`, restarts always, reads `/etc/bandshell/bandshell.env` |
 | sandbox | installs `bubblewrap`; set `SCRIPT_SANDBOX=1` in the env file so a broken sandbox fails loudly instead of silently running scripts unsandboxed |
+| idle shutdown | writes `/etc/sudoers.d/bandshell-shutdown` (only `shutdown -h now`/`poweroff`, only for the app user, no password) so the app can power the host off when idle — enabled with `--auto-shutdown N` or `AUTO_SHUTDOWN_MINUTES` in the env file |
+
+### Idle shutdown (cost control)
+
+The app can power its host off after a period of genuine inactivity — useful when it's
+used a few times a month but would otherwise bill 24/7. Enable it in the env file:
+
+```ini
+AUTO_SHUTDOWN_MINUTES=60
+```
+
+What counts as activity: loading the app, creating/editing anything, pressing
+Approve/Reject/Done, and **any** interaction with the live browser view (clicks, typing,
+scroll, paste). What doesn't: the website panel's 1s poll, `/api/health` and
+`/api/activity` — so a forgotten browser tab can't keep the machine awake.
+
+It refuses to power off while work is in flight: an agent or script runner still
+running, a website waiting for your approval, or a scripted run's review page you
+haven't submitted. For a genuinely abandoned review page, `AUTO_SHUTDOWN_MAX_HOURS`
+forces the issue after that much uptime.
+
+```bash
+# watch it without risking a surprise power-off:
+#   AUTO_SHUTDOWN_DRY_RUN=1   (then)  sudo systemctl restart bandshell
+curl -s http://127.0.0.1:8000/api/activity
+# {"enabled":true,"idle_seconds":312.0,"busy":false,
+#  "would_shut_down_in_seconds":2880.0,"auto_shutdown_minutes":60.0,...}
+sudo journalctl -u bandshell | grep 'idle shutdown'
+```
+
+A powered-off instance must be started again (`gcloud compute instances start <vm>`,
+console, or a Cloud Scheduler job). The app's state survives if Google Sheets
+persistence is configured; otherwise in-memory state is lost with the power-off.
+
 
 ### Serving externally
 
@@ -139,6 +177,8 @@ polls) can exceed it, which shows up as the live view freezing while pages still
 | a page is served but **200 without a prompt** | another nginx site is answering: `sudo nginx -T \| grep -nE 'listen\|server_name\|proxy_pass'` |
 | live view is blank, WS closes with 1006/404 | missing `Upgrade`/`Connection` headers (see snippet above), or the tunnel points at uvicorn |
 | scripted runs die with `exit 137` | sandbox `/proc` or memory limits; try `SANDBOX_CLIENT=mcp`, raise `SANDBOX_MAX_MEMORY_MB`, and check `[sandbox]` lines in `journalctl -u bandshell` |
+| the VM powered off by itself | that's `AUTO_SHUTDOWN_MINUTES` doing its job: `journalctl -u bandshell \| grep 'idle shutdown'` shows when and why. Set it to `0` to disable, or leave it and start the VM when you need it |
+| idle shutdown never fires | in-flight work blocks it (check `busy` in `/api/activity`); press **Done** on a review page, or look for a sudoers error in the journal |
 ## Repository layout
 
 | Path | Purpose |
@@ -155,11 +195,13 @@ polls) can exceed it, which shows up as the live view freezing while pages still
 | `storage.py` `drive.py` `memory_storage.py` | Persistence facade (Google Sheets optional) |
 | `serialization.py` | Dataclass ↔ API-dict conversion, settings-version hashing |
 | `state.py` | Shared globals: LLM config, in-memory registries, sandbox/deploy settings |
+| `idle.py` | Idle-shutdown watchdog: activity tracking, `busy` guard, the shutdown command |
 | `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner: apt deps, `uv`, venv, Chromium, nginx site + auth + rate limit, systemd unit, env file, smoke checks |
 | `docs/sandbox-plan.md` | Sandbox design + threat model + what was verified |
 | `frontend/` | Static UI (`index.html`, `app.js`, `style.css`) |
 | `logs/` | Runtime LLM usage + per-run transcripts (JSONL, gitignored) |
 | `tools/sandbox_smoke.py` | Smoke test for the bwrap + MCP-stdio sandbox bridge (no browser needed) |
+| `tools/idle_smoke.py` | Smoke test for the idle-shutdown watchdog (7 scenarios, no browser/network) |
 
 ## Key behavior notes
 
@@ -209,7 +251,8 @@ Both files append forever and `generated/` grows by two dumps per codegen attemp
 long-lived host, prune them (`find logs generated -type f -mtime +30 -delete`).
 
 For a deployed instance, `journalctl -u bandshell -f` shows the app's stdout/stderr,
-including the `[sandbox-runner]` / `[sandbox]` breadcrumbs and the `[browser-ws] ~X.Xfps`
-line that tells you whether the live view is actually producing frames.
+including the `[sandbox-runner]` / `[sandbox]` breadcrumbs, the `[idle]` shutdown
+decisions, and the `[browser-ws] ~X.Xfps` line that tells you whether the live view is
+actually producing frames.
 
 See `AGENTS.md` for the in-depth agent-oriented guide to the codebase.

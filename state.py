@@ -68,6 +68,26 @@ SANDBOX_MAX_MEMORY_MB = int(os.getenv("SANDBOX_MAX_MEMORY_MB", "1024") or 1024)
 # fastmcp import can be the peak-memory moment of a run (SIGKILL/exit 137).
 SANDBOX_CLIENT = (os.getenv("SANDBOX_CLIENT") or "auto").strip().lower()
 
+# --- Idle shutdown (see idle.py) ---
+# Power the host off after this many minutes with no real human activity. The
+# UI's 1s polls don't count, so a forgotten browser tab can't keep a VM billing.
+# 0 (default) = disabled — a dev machine must never power itself off. Fractions
+# are allowed (0.5 = 30s), which makes the timer easy to test.
+AUTO_SHUTDOWN_MINUTES = float(os.getenv("AUTO_SHUTDOWN_MINUTES", "0") or 0)
+# Escape hatch for a genuinely abandoned review page: power off after this many
+# hours of uptime even if work is "in flight". 0 (default) = never force.
+AUTO_SHUTDOWN_MAX_HOURS = float(os.getenv("AUTO_SHUTDOWN_MAX_HOURS", "0") or 0)
+# How often the watchdog wakes up. Only observable in /api/activity + logs.
+AUTO_SHUTDOWN_CHECK_SECONDS = float(os.getenv("AUTO_SHUTDOWN_CHECK_SECONDS", "30") or 30)
+# `-n` is deliberate: sudo must fail fast instead of blocking on a password
+# prompt (which would hang the watchdog forever). deploy/install.sh writes the
+# matching /etc/sudoers.d/bandshell-shutdown rule.
+AUTO_SHUTDOWN_COMMAND = (os.getenv("AUTO_SHUTDOWN_COMMAND")
+                         or "sudo -n /usr/sbin/shutdown -h now")
+# Log the decision instead of running the command (watch the timer on a real host).
+AUTO_SHUTDOWN_DRY_RUN = (os.getenv("AUTO_SHUTDOWN_DRY_RUN") or "").strip().lower() in (
+    "1", "true", "yes", "on")
+
 # --- The mounted browser MCP agent (Bot drives Playwright through this) ---
 parent = FastMCP("parent")
 parent.mount(browser_mcp)

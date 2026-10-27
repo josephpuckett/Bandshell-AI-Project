@@ -22,6 +22,7 @@ process memory (restart loses events, websites, scripts, settings).
 
 | File | Purpose |
 |------|---------|
+| `idle.py` | Idle-shutdown watchdog. Tracks *real* human activity (the UI's 1s polls, `/api/health` and `/api/activity` are exempt, so a forgotten tab can't keep a VM billing), refuses to power off while work is in flight (`busy_check`, supplied by `main.py`), then runs `AUTO_SHUTDOWN_COMMAND` (`sudo -n … shutdown -h now`). Logs the decision, retries at most once per 5 min, and supports `AUTO_SHUTDOWN_DRY_RUN`. |
 | `main.py` | FastAPI app + route handlers (app wiring, lifespan, all `/api/*` endpoints incl. `/api/health` and the browser WebSocket). Entry point. |
 | `state.py` | Shared global state/config: LLM provider, mounted browser MCP (`parent`), frontend path, and all in-memory registries + settings. |
 | `agents.py` | Long-running agent orchestration: `run_onboarding` and `run_task` state machines. |
@@ -29,6 +30,7 @@ process memory (restart loses events, websites, scripts, settings).
 | `sandbox_framing.py` | MCP stdio framing bound to arbitrary pipes (`framed_streams` for the host's asyncio pipe pair, `framed_stdio` for the child's own stdin/stdout). Shared by both sandbox halves; ~50 lines on top of the SDK's `JSONRPCMessage`/`SessionMessage`. |
 | `sandbox_host.py` | Host side of the sandbox: a low-level `mcp` `Server` bound to the bwrap child's pipes, exposing exactly the 11 `ALLOWED_API` ops plus the `get_job`/`report` bootstrap tools, all dispatching into the real `Driver` against the review page. Per-run instance; caps calls and argument sizes. |
 | `sandbox_runner.py` | Sandbox side: the only code executed inside bwrap. A `fastmcp.Client` over its **own** stdin/stdout (inverted stdio — it cannot spawn), fetches `get_job`, `exec`s the script in a scrubbed namespace, forwards each `api.*` as an MCP `tools/call`, reports the outcome, exits. **stdout is the wire** — script output is redirected to stderr. |
+| `tools/idle_smoke.py` | 7-scenario smoke test for the idle watchdog (no browser, no network; each scenario runs in its own subprocess because `idle.py` holds module-level state). |
 | `tools/sandbox_smoke.py` | VM smoke test for the sandbox bridge (bwrap flags, fd/pipe inheritance, framing both ways, event delivery, stdout hygiene, error propagation, runaway timeout). Uses a stub dispatcher, so it needs no browser. |
 | `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner for a real host: apt deps (incl. Chromium libs + bubblewrap), `uv` **as the app user**, `uv sync --frozen`, `playwright install chromium`, nginx site + snippet + basic auth + rate limit, systemd unit, `/etc/bandshell/bandshell.env`, then smoke checks (app imports, Chromium renders, sandbox smoke test, `/api/health`, auth probe must return 401). Re-runnable; aborts at the first failing step. |
 | `docs/sandbox-plan.md` | Sandbox design + threat model + the bugs found during E2E verification. |
@@ -81,6 +83,14 @@ process memory (restart loses events, websites, scripts, settings).
     explained by the MCP client's imports.
     `SANDBOX_ERROR_PREFIX` (`sandbox-unavailable:`) marks failures where the script never
     ran; `agents.py` aborts on that prefix instead of asking the LLM to rewrite.
+  - **Idle shutdown**: `AUTO_SHUTDOWN_MINUTES` (0 = off, the default — a dev machine must
+    never power itself off; fractions allowed for testing), `AUTO_SHUTDOWN_MAX_HOURS`
+    (force off after N h uptime even while busy; 0 = never), `AUTO_SHUTDOWN_DRY_RUN`
+    (log the decision, don't power off), `AUTO_SHUTDOWN_CHECK_SECONDS` (30) and
+    `AUTO_SHUTDOWN_COMMAND` (`sudo -n /usr/sbin/shutdown -h now`). `-n` is deliberate:
+    sudo must fail fast, not block on a password prompt. `deploy/install.sh` writes the
+    matching `/etc/sudoers.d/<site>-shutdown`. Verify with
+    `.venv/bin/python3 tools/idle_smoke.py` and `GET /api/activity`.
 
 ```
 uvicorn main:app --host 127.0.0.1 --port 8000
@@ -337,6 +347,11 @@ main.py       <- depends on everything; imports agents/serialization/state
   pages are tracked in `browser.LIVE_PAGES` (keyed by website_id) with a fallback to the
   agent's own session page during onboarding; the WS endpoint logs hits and close codes so
   proxy/upstream failures are diagnosable (see the nginx note in How to Run).
+- **Idle-shutdown banner:** the watchdog pushes `{"type": "shutdown", "reason": ...}` to
+  every attached live-view socket right before powering off; `app.js` renders it in the
+  `#browserHint` bar so the view doesn't just freeze mid-review. `_OPEN_VIEWS` (a set of
+  live web sockets in `main.py`) exists for that broadcast and is also where
+  `idle.stream_open/close` is driven from.
 - **Browser lifecycle:** the agent's browser window closes when its interaction finishes —
   `run_onboarding` shuts the manual-fill session as soon as the human approves it (the script
   runs in its own fresh context afterwards), and both agent paths tear down the session in
@@ -385,10 +400,12 @@ main.py       <- depends on everything; imports agents/serialization/state
 - **Unbounded runtime files.** `logs/llm_usage.jsonl` appends forever and `generated/` grows
   by two files per codegen attempt; there is no rotation or cleanup yet (harmless on a
   rare-use VM, worth adding before a long-lived one).
-- **Idle shutdown is designed but not implemented** (see the hosting discussion):
-  `AUTO_SHUTDOWN_MINUTES` (0 = off) + `/api/activity` + a guard that refuses to power off
-  while a browser stream is open or a runner is active + one sudoers line. Until then a VM
-  runs 24/7.
+- **Idle shutdown is implemented and verified in-process, not on a real VM.** All 7
+  `tools/idle_smoke.py` scenarios pass, the middleware/endpoint/broadcast were exercised
+  against a live uvicorn, and the installer writes the sudoers rule (validated with
+  `visudo -c -f`). Unproven on a host: the actual power-off (i.e. that the sudoers rule
+  matches the command) and that SIGTERM's graceful shutdown flushes Sheets. Test there with
+  `AUTO_SHUTDOWN_DRY_RUN=1` first. Design notes are in `idle.py`'s docstring.
 - **TLS is untested** — the installer's `--domain` path runs certbot (and is skipped by
   design when nginx isn't on `:80`), but no real Let's Encrypt issuance has been exercised.
 - **Script writing/execution was debugged and fixed** (double-generate in codegen, helper-fn

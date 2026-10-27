@@ -9,7 +9,10 @@
 #   4. downloads the Playwright Chromium build
 #   5. writes an nginx site (HTTP + WebSocket upgrade, long read timeouts)
 #   6. writes + enables a systemd unit that runs uvicorn on 127.0.0.1
-#   7. runs smoke checks (app imports, headless Chromium launches, bwrap sandbox)
+#   7. writes /etc/bandshell/bandshell.env (template) + a sudoers rule so the app
+#      can power the host off when idle (AUTO_SHUTDOWN_MINUTES, off by default)
+#   8. runs smoke checks (app imports, headless Chromium launches, bwrap sandbox,
+#      /api/health, and the auth probe must return 401)
 #
 # It does NOT touch your environment/secrets. Provide them in:
 #     /etc/bandshell/bandshell.env      (KEY=VALUE lines, chmod 600)
@@ -27,6 +30,7 @@
 #   sudo bash deploy/install.sh --nginx-port 80       # default is 8080
 #   sudo bash deploy/install.sh --port 9000           # uvicorn port
 #   sudo bash deploy/install.sh --domain events.example.org --email you@example.org
+#   sudo bash deploy/install.sh --auto-shutdown 60    # power off after 60 min idle
 #   sudo bash deploy/install.sh --no-auth       # NOT recommended; warns loudly
 #   sudo bash deploy/install.sh --no-service --no-sandbox-test
 #
@@ -53,6 +57,9 @@ AUTH_PASS_EXPLICIT=0                 # 1 when supplied via flag/env
 INSTALL_SERVICE="${INSTALL_SERVICE:-1}"
 RUN_SANDBOX_TEST="${RUN_SANDBOX_TEST:-1}"
 BROWSER_CHANNEL="chromium"
+AUTO_SHUTDOWN_MINUTES="${AUTO_SHUTDOWN_MINUTES:-0}"   # 0 = never (the app's default)
+AUTO_SHUTDOWN_MINUTES_EXPLICIT=0      # 1 when --auto-shutdown was passed
+SUDO_SHUTDOWN=1                       # write the sudoers rule for idle shutdown
 
 # --------------------------------------------------------------------------- #
 # Output helpers
@@ -88,6 +95,8 @@ while [ $# -gt 0 ]; do
         --auth-user)      AUTH_USER="${2:?}"; shift 2 ;;
         --auth-pass)      AUTH_PASS="${2:?}"; AUTH_PASS_EXPLICIT=1; shift 2 ;;
         --no-auth)        AUTH_ENABLED=0; shift ;;
+        --auto-shutdown)  AUTO_SHUTDOWN_MINUTES="${2:?}"; AUTO_SHUTDOWN_MINUTES_EXPLICIT=1; shift 2 ;;
+        --no-shutdown-sudo) SUDO_SHUTDOWN=0; shift ;;
         --no-service)     INSTALL_SERVICE=0; shift ;;
         --no-sandbox-test) RUN_SANDBOX_TEST=0; shift ;;
         -h|--help)        usage ;;
@@ -125,6 +134,13 @@ if [ "$AUTH_ENABLED" = "0" ] && [ "$AUTH_PASS_EXPLICIT" = "1" ]; then
 fi
 HTPASSWD_FILE="/etc/nginx/${SITE_NAME}.htpasswd"
 ENV_FILE="/etc/bandshell/bandshell.env"
+# Resolve the power-off binary ONCE so the env file, the app's sudo command and
+# the sudoers rule all name the same path (Debian ships /sbin/shutdown and
+# /usr/sbin/shutdown; which one exists depends on usr-merge).
+SHUTDOWN_BIN="$(command -v shutdown || echo /usr/sbin/shutdown)"
+case "$AUTO_SHUTDOWN_MINUTES" in
+    ''|*[!0-9.]*) die "--auto-shutdown expects minutes, e.g. 60 (or 0.5 to test)" ;;
+esac
 LIMIT_ZONE="${SITE_NAME//-/_}_cost"
 PROXY_SNIPPET="/etc/nginx/snippets/${SITE_NAME}-proxy.conf"
 
@@ -438,11 +454,38 @@ if [ ! -f "$ENV_FILE" ]; then
 # BROWSER=chromium
 # BROWSER_FPS=4
 # BROWSER_JPEG_QUALITY=80
+# (idle-shutdown keys are appended below, expanded with resolved paths)
 ENVEOF
     # Tolerate a non-root run (e.g. local testing); the mode is the important bit.
     chown root:root "$ENV_FILE" 2>/dev/null || true
     chmod 600 "$ENV_FILE" || warn "could not chmod 600 $ENV_FILE"
     ok "created $ENV_FILE (mode 600) — put OPENROUTER_API_KEY in it"
+fi
+
+# Idle shutdown: append the keys with the resolved power-off path, so the env
+# file and the sudoers rule (5c) always agree. An existing value is kept.
+if ! grep -qE "^[[:space:]]*AUTO_SHUTDOWN_COMMAND=" "$ENV_FILE"; then
+    cat >>"$ENV_FILE" <<ENVEOF
+
+# Power the host off after nobody has used the app for a while (0 = disabled).
+# Fractions are allowed (0.5 = 30s) which makes the timer easy to test. The UI's
+# 1s polls do NOT count as activity, so a forgotten tab can't keep a VM billing.
+# Verify with AUTO_SHUTDOWN_DRY_RUN=1 (logs the decision, doesn't power off).
+AUTO_SHUTDOWN_MINUTES=$AUTO_SHUTDOWN_MINUTES
+# AUTO_SHUTDOWN_MAX_HOURS=0        # force off after N h uptime even if "busy"
+# AUTO_SHUTDOWN_DRY_RUN=1
+# AUTO_SHUTDOWN_CHECK_SECONDS=30
+AUTO_SHUTDOWN_COMMAND=sudo -n $SHUTDOWN_BIN -h now
+ENVEOF
+fi
+if [ "$AUTO_SHUTDOWN_MINUTES_EXPLICIT" = "1" ]; then
+    # --auto-shutdown N: set the value (and un-comment it if it was disabled).
+    if grep -qE "^[[:space:]]*AUTO_SHUTDOWN_MINUTES=" "$ENV_FILE"; then
+        sed -i "s|^[[:space:]]*AUTO_SHUTDOWN_MINUTES=.*|AUTO_SHUTDOWN_MINUTES=$AUTO_SHUTDOWN_MINUTES|" "$ENV_FILE"
+    else
+        printf 'AUTO_SHUTDOWN_MINUTES=%s\n' "$AUTO_SHUTDOWN_MINUTES" >>"$ENV_FILE"
+    fi
+    ok "idle shutdown: power off after ${AUTO_SHUTDOWN_MINUTES} min of inactivity"
 fi
 
 # Did the caller export keys in their shell, expecting the service to see them?
@@ -453,6 +496,43 @@ fi
 if ! grep -qE "^[[:space:]]*OPENROUTER_API_KEY=[^[:space:]#]" "$ENV_FILE"; then
     warn "$ENV_FILE has no OPENROUTER_API_KEY yet — the UI will load,"
     warn "  but every AI action (onboarding) will fail until you add it."
+fi
+
+# --------------------------------------------------------------------------- #
+# 5c. Sudoers rule for idle shutdown
+# --------------------------------------------------------------------------- #
+step "Idle-shutdown privilege"
+if [ "$SUDO_SHUTDOWN" = "1" ]; then
+    SUDOERS_FILE="/etc/sudoers.d/${SITE_NAME}-shutdown"
+    cat >"$SUDOERS_FILE.tmp" <<SUDOEOF
+# Managed by Bandshell Calendar deploy/install.sh — lets the app power this host
+# off when idle (AUTO_SHUTDOWN_MINUTES in $ENV_FILE).
+#
+# Only these exact commands, only for the service user, only without a password:
+# the app runs "sudo -n $SHUTDOWN_BIN -h now" (see idle.py). Nothing else is granted.
+# NOTE: no backticks in this heredoc — it is unquoted, so they would be executed.
+$APP_USER ALL=(root) NOPASSWD: $SHUTDOWN_BIN -h now, /usr/sbin/poweroff, /sbin/poweroff
+SUDOEOF
+    if visudo -c -f "$SUDOERS_FILE.tmp" >/dev/null 2>&1; then
+        # sudoers.d ignores filenames containing a '.' and requires 0440 root:root.
+        install -m 0440 "$SUDOERS_FILE.tmp" "$SUDOERS_FILE" 2>/dev/null \
+            || cp -f "$SUDOERS_FILE.tmp" "$SUDOERS_FILE"
+        rm -f "$SUDOERS_FILE.tmp"
+        chown root:root "$SUDOERS_FILE" 2>/dev/null || true
+        chmod 0440 "$SUDOERS_FILE" 2>/dev/null || true
+        ok "sudoers: $APP_USER may run '$SHUTDOWN_BIN -h now' without a password"
+    else
+        rm -f "$SUDOERS_FILE.tmp"
+        warn "could not validate the sudoers rule for $APP_USER — idle shutdown will"
+        warn "  log a permission error instead of powering off (everything else works)."
+    fi
+    # A sudoers file owned by anyone but root is IGNORED by sudo (silently).
+    if [ -f "$SUDOERS_FILE" ] && [ "$(stat -c '%U:%a' "$SUDOERS_FILE" 2>/dev/null)" != "root:440" ]; then
+        warn "  $SUDOERS_FILE is $(stat -c '%U %a' "$SUDOERS_FILE" 2>/dev/null) —"
+        warn "  sudo needs root:root 0440. Fix with: sudo chown root:root $SUDOERS_FILE && sudo chmod 440 $SUDOERS_FILE"
+    fi
+else
+    warn "skipped the sudoers rule (--no-shutdown-sudo): idle shutdown will not work"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -511,6 +591,14 @@ fi
 # --------------------------------------------------------------------------- #
 # 7. Smoke checks
 # --------------------------------------------------------------------------- #
+# Idle-shutdown status line for the summary (blank/0 == disabled).
+_idle_min="$(awk -F= '/^[[:space:]]*AUTO_SHUTDOWN_MINUTES=/{v=$2; gsub(/[[:space:]]/,"",v)} END{print v}' "$ENV_FILE" 2>/dev/null || true)"
+if [ -n "${_idle_min:-}" ] && [ "$(awk -v v="$_idle_min" 'BEGIN{print (v+0>0)?1:0}')" = "1" ]; then
+    IDLE_LINE="on — ${_idle_min} min"
+else
+    IDLE_LINE="disabled — e.g. AUTO_SHUTDOWN_MINUTES=60"
+fi
+
 step "Smoke checks"
 if as_user "$APP_DIR/.venv/bin/python" -c 'import main' 2>/tmp/bandshell-import.err; then
     ok "app imports (dependencies complete)"
@@ -647,8 +735,11 @@ Next steps:
   3. On a headless server keep HEADLESS=1 (already set in the unit).
   4. Script sandbox: install bubblewrap (done) and set SCRIPT_SANDBOX=1 so a broken
      sandbox fails loudly instead of silently running scripts unsandboxed.
-  5. Idle cost control: implement the inactivity watchdog (main.py) + a sudoers line
-     for \`shutdown\`, or wire a Cloud Scheduler job to stop the instance.
+  5. Idle cost control: set AUTO_SHUTDOWN_MINUTES in ${ENV_FILE} (currently ${IDLE_LINE})
+     to power the host off after inactivity — the sudoers rule is already installed.
+     Test it first with AUTO_SHUTDOWN_DRY_RUN=1, then check:
+       curl -s http://127.0.0.1:${PORT}/api/activity
+     A stopped instance must be started again (gcloud compute instances start …).
 SUMMARY
 
 if [ "$VERIFY_FAILED" = "1" ]; then

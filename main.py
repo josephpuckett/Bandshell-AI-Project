@@ -22,6 +22,7 @@ from browser import (clear_all_live_pages, clear_live_page, get_live_page,
                      manager)
 import eventbrite_api
 from event import Event
+import idle
 from serialization import (asset_url, current_settings_version, event_out,
                            task_out, website_out, _parse_event_id)
 from settings import Settings
@@ -37,6 +38,10 @@ from website import Website
 # Browser contexts left open for the human to review a scripted run and submit
 # manually. Keyed by website_id; only one is kept open per website at a time.
 review_contexts: dict[UUID, object] = {}
+
+# Live-view WebSockets currently attached (so the idle watchdog can announce a
+# shutdown to anyone watching, and so "someone is watching" is observable).
+_OPEN_VIEWS: set = set()
 
 
 @asynccontextmanager
@@ -62,7 +67,10 @@ async def lifespan(app: FastAPI):
                           'content': 'Setup was interrupted by a restart; site reset.'})
             storage.mark_dirty()
     storage.start()
+    # Power the host off after a period of real inactivity (opt-in; see idle.py).
+    idle.start(busy_check=_busy_work, before_shutdown=_shutdown_notice)
     yield
+    await idle.stop()
     for t in runners.values():
         t.cancel()
     for t in website_runners.values():
@@ -91,6 +99,53 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _busy_work() -> bool:
+    """True while anything in flight would be LOST by stopping the process.
+
+    Used by the idle watchdog: an unfinished agent/script runner, a website
+    waiting for human approval, or an open review context (a scripted run's
+    filled form the human hasn't submitted yet) all mean "do not power off" —
+    all of that state is in-memory/browser-only.
+    """
+    for t in list(runners.values()) + list(website_runners.values()):
+        if not t.done():
+            return True
+    if review_contexts:
+        return True
+    for w in websites.values():
+        # awaiting the human mid-onboarding (its runner may already be gone)
+        if w.status == 'scripting' and w.phase in ('manual_approval', 'script_approval'):
+            return True
+    return False
+
+
+async def _shutdown_notice(reason: str) -> None:
+    """Tell connected live views, then flush state before the box goes down.
+
+    The UI shows a banner so nobody is surprised mid-review. systemd's SIGTERM
+    runs the lifespan teardown afterwards, which persists anything still dirty.
+    """
+    msg = {'type': 'shutdown', 'reason': reason}
+    for ws in list(_OPEN_VIEWS):
+        try:
+            await _safe_send(ws, msg, timeout=1.0)
+        except Exception:
+            pass
+    try:
+        await storage.flush()
+    except Exception:
+        pass
+    print(f'[idle] shutting down: {reason}')
+
+
+@app.middleware('http')
+async def _activity_middleware(request, call_next):
+    """Feed the idle watchdog with real human traffic (the UI's polls are ignored)."""
+    idle.note_request(request.url.path, request.method)
+    return await call_next(request)
+
+
+
 # ----------------------------- Health ----------------------------------------
 @app.get('/api/health')
 async def health():
@@ -114,7 +169,20 @@ async def health():
         'browser_engine': os.getenv('BROWSER') or 'chromium',
         'events': len(events),
         'websites': len(websites),
+        'auto_shutdown_minutes': state.AUTO_SHUTDOWN_MINUTES,
     }
+
+
+# ----------------------------- Idle activity ---------------------------------
+@app.get('/api/activity')
+async def activity():
+    """How idle is this instance, and when would the watchdog power it off?
+
+    Exempt from activity tracking itself (see idle.py), so polling it doesn't
+    keep the host awake. `busy` means in-flight work (an agent run, a pending
+    approval, an unsubmitted review page) — the watchdog won't power off then.
+    """
+    return idle.snapshot()
 
 
 # ----------------------------- Settings --------------------------------------
@@ -897,6 +965,8 @@ async def browser_stream(websocket: WebSocket, website_id: str):
         return
     print(f'[browser-ws] websocket connected for {wid} (from {websocket.client.host})')
     await websocket.accept()
+    _OPEN_VIEWS.add(websocket)
+    idle.stream_open()
     last_frame: bytes | None = None
     next_frame_at = 0.0
     frame_interval = 1.0 / BROWSER_FPS
@@ -1044,6 +1114,8 @@ async def browser_stream(websocket: WebSocket, website_id: str):
     except Exception:
         pass
     finally:
+        _OPEN_VIEWS.discard(websocket)
+        idle.stream_close()
         if cdp is not None:
             try:
                 await _stop_screencast(cdp)
@@ -1083,6 +1155,7 @@ async def _drain_view_events(websocket: WebSocket, wid: UUID, timeout: float = 0
             break
         try:
             raw = await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+            idle.note_human()      # a click/scroll/keystroke is a real human
             if isinstance(raw, str):
                 try:
                     ev = json.loads(raw)

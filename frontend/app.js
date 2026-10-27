@@ -332,6 +332,15 @@ function openBrowserStream(id) {
             // bar; it sticks until the next frame/ping refreshes interactive state.
             browserHintOverride = msg.text || "";
             document.getElementById("browserHint").textContent = browserHintOverride;
+        } else if (msg.type === "shutdown") {
+            // The idle watchdog is powering the host off. Nothing is lost (the
+            // server flushes storage and refuses to shut down while work is in
+            // flight), but the page will go dead — say so instead of freezing.
+            browserHintOverride = "";
+            document.getElementById("browserHint").innerHTML =
+                "<b>⏻ This server is shutting down</b> (inactive) — "
+                + escapeHtml(msg.reason || "no activity") + ". Restart it to continue.";
+            document.getElementById("browserDoneBtn").classList.add("off");
         } else if (msg.type === "empty") {
             browserVW = 0; browserVH = 0;
             browserHintOverride = "";
