@@ -24,17 +24,25 @@ looking at it.
 
 ## Quick start
 
-Requires Python 3.12 with the deps in `pyproject.toml` (existing venv: `.venv`), plus:
+Requirements: Python 3.12 with the deps in `pyproject.toml`, plus:
 
 - `OPENROUTER_API_KEY` — LLM calls go to OpenRouter (model configured in `state.py`)
-- Firefox (runs `headless=False`, so a visible window appears on the server)
+- Chromium — Playwright's browser (`BROWSER=firefox` switches engines; Firefox loses the
+  CDP screencast, so the live view falls back to slower per-frame screenshots)
 
 ```bash
-uvicorn main:app --host 127.0.0.1 --port 8000
+apt-get install bubblewrap          # optional: script sandbox (recommended)
+uv sync                             # creates .venv from uv.lock (CPython 3.12)
+.venv/bin/playwright install --with-deps chromium
+HEADLESS=1 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Then open `http://127.0.0.1:8000`, create an Event, add a Website, and run through the
-guided setup.
+A visible browser window opens on the machine running the app unless `HEADLESS=1`. Then
+open `http://127.0.0.1:8000`, create an Event, add a Website, and run through the guided
+setup.
+
+For an actual server, skip the steps above and use `deploy/install.sh` (next section) —
+it does all of this, plus nginx, auth, and systemd.
 
 ### Optional configuration (env vars)
 
@@ -86,33 +94,51 @@ curl -s http://127.0.0.1:8000/api/health
 
 `/api/health` reports booleans only (never values), so it is safe to expose.
 
+The installer is idempotent — re-run it after a `git pull` to refresh deps and configs.
+It refuses to leave a competing nginx site enabled: if another config listens on the same
+port or proxies to the same uvicorn port, it names the file to remove before reloading
+(a failed reload would leave the old, *unauthenticated* site serving).
+
+#### What it sets up
+
+| Piece | Result |
+|---|---|
+| nginx | listens on `--nginx-port` (default **8080**), proxies to `127.0.0.1:8000`, WebSocket upgrade + 3600s timeouts for the live view |
+| auth | HTTP Basic on **every** route (the app has no login of its own); password in `/etc/nginx/bandshell.htpasswd` |
+| rate limit | `6r/m` + burst 3 on the two endpoints that cost money (`…/onboard`, `…/run`) |
+| systemd | `bandshell.service`, `--workers 1`, restarts always, reads `/etc/bandshell/bandshell.env` |
+| sandbox | installs `bubblewrap`; set `SCRIPT_SANDBOX=1` in the env file so a broken sandbox fails loudly instead of silently running scripts unsandboxed |
+
 ### Serving externally
 
-The embedded live browser view uses a WebSocket (`/api/browser/{id}/ws`), so a reverse
-proxy must pass WebSocket upgrade headers. The frontend derives the WS URL from the page
-host, so any tunnel (ngrok, Cloudflare, Tailscale) works without code changes.
+The embedded live browser view uses a WebSocket (`/api/browser/{id}/ws`). The frontend
+derives the WS URL from the page host, so any tunnel (ngrok, Cloudflare, Tailscale) works
+without code changes — **but it must point at nginx, not at uvicorn**:
 
-Recommended setup: `nginx` on the server reverse-proxying to uvicorn, then an HTTPS
-tunnel (ngrok / Cloudflare tunnel) in front:
-
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto https;
-    proxy_set_header Upgrade $http_upgrade;          # WebSocket pass-through
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-}
+```bash
+tunnel → http://127.0.0.1:8080   # nginx: auth + WebSocket upgrade
+             ↓
+        127.0.0.1:8000         # uvicorn: loopback only, no auth
 ```
 
-Note: ngrok tunnels WebSockets transparently. On ngrok's free tier the URL changes
-per restart — consider a static domain for anything persistent.
+A tunnel aimed straight at `127.0.0.1:8000` bypasses the password entirely. Everything the
+proxy needs is in `/etc/nginx/snippets/bandshell-proxy.conf` (shared by every location, so
+a `certbot --nginx` rewrite can't drop it); don't hand-edit the site file — re-run the
+installer instead.
 
+On ngrok's free tier the URL changes per restart — use a static domain for anything
+persistent, and note the free tier's connection cap: a busy session (long-lived WS + 1s
+polls) can exceed it, which shows up as the live view freezing while pages still load.
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `/api/health` says `llm_configured: false` | the key isn't in `/etc/bandshell/bandshell.env` (a shell `export` or a repo `.env` has no effect on a systemd service). Add `OPENROUTER_API_KEY=…`, then `sudo systemctl restart bandshell` |
+| every page returns **401** | basic auth is on — that's the intended state; the browser prompts once and caches it |
+| a page is served but **200 without a prompt** | another nginx site is answering: `sudo nginx -T \| grep -nE 'listen\|server_name\|proxy_pass'` |
+| live view is blank, WS closes with 1006/404 | missing `Upgrade`/`Connection` headers (see snippet above), or the tunnel points at uvicorn |
+| scripted runs die with `exit 137` | sandbox `/proc` or memory limits; try `SANDBOX_CLIENT=mcp`, raise `SANDBOX_MAX_MEMORY_MB`, and check `[sandbox]` lines in `journalctl -u bandshell` |
 ## Repository layout
 
 | Path | Purpose |
@@ -128,6 +154,9 @@ per restart — consider a static domain for anything persistent.
 | `eventbrite_api.py` | Eventbrite API client (drafts, image upload) |
 | `storage.py` `drive.py` `memory_storage.py` | Persistence facade (Google Sheets optional) |
 | `serialization.py` | Dataclass ↔ API-dict conversion, settings-version hashing |
+| `state.py` | Shared globals: LLM config, in-memory registries, sandbox/deploy settings |
+| `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner: apt deps, `uv`, venv, Chromium, nginx site + auth + rate limit, systemd unit, env file, smoke checks |
+| `docs/sandbox-plan.md` | Sandbox design + threat model + what was verified |
 | `frontend/` | Static UI (`index.html`, `app.js`, `style.css`) |
 | `logs/` | Runtime LLM usage + per-run transcripts (JSONL, gitignored) |
 | `tools/sandbox_smoke.py` | Smoke test for the bwrap + MCP-stdio sandbox bridge (no browser needed) |
@@ -175,5 +204,12 @@ per restart — consider a static domain for anything persistent.
   cut a response short).
 - `logs/onboarding_*.jsonl` / `logs/task_*.jsonl` — full per-run transcripts (tool calls +
   results included).
+
+Both files append forever and `generated/` grows by two dumps per codegen attempt — on a
+long-lived host, prune them (`find logs generated -type f -mtime +30 -delete`).
+
+For a deployed instance, `journalctl -u bandshell -f` shows the app's stdout/stderr,
+including the `[sandbox-runner]` / `[sandbox]` breadcrumbs and the `[browser-ws] ~X.Xfps`
+line that tells you whether the live view is actually producing frames.
 
 See `AGENTS.md` for the in-depth agent-oriented guide to the codebase.

@@ -22,7 +22,7 @@ process memory (restart loses events, websites, scripts, settings).
 
 | File | Purpose |
 |------|---------|
-| `main.py` | FastAPI app + route handlers (app wiring, lifespan, all `/api/*` endpoints). Entry point. |
+| `main.py` | FastAPI app + route handlers (app wiring, lifespan, all `/api/*` endpoints incl. `/api/health` and the browser WebSocket). Entry point. |
 | `state.py` | Shared global state/config: LLM provider, mounted browser MCP (`parent`), frontend path, and all in-memory registries + settings. |
 | `agents.py` | Long-running agent orchestration: `run_onboarding` and `run_task` state machines. |
 | `scripting.py` | Safe script execution: `Driver` (the `api` surface), `validate_script`, `execute_script_in_process`, `run_script_against_event`. Pages opened for scripted runs get a pinned `VIEWPORT=(1280, 850)` (desktop size for the embedded view). `run_script_against_event` executes the script inside the bwrap sandbox when available, else in-process. |
@@ -30,6 +30,8 @@ process memory (restart loses events, websites, scripts, settings).
 | `sandbox_host.py` | Host side of the sandbox: a low-level `mcp` `Server` bound to the bwrap child's pipes, exposing exactly the 11 `ALLOWED_API` ops plus the `get_job`/`report` bootstrap tools, all dispatching into the real `Driver` against the review page. Per-run instance; caps calls and argument sizes. |
 | `sandbox_runner.py` | Sandbox side: the only code executed inside bwrap. A `fastmcp.Client` over its **own** stdin/stdout (inverted stdio — it cannot spawn), fetches `get_job`, `exec`s the script in a scrubbed namespace, forwards each `api.*` as an MCP `tools/call`, reports the outcome, exits. **stdout is the wire** — script output is redirected to stderr. |
 | `tools/sandbox_smoke.py` | VM smoke test for the sandbox bridge (bwrap flags, fd/pipe inheritance, framing both ways, event delivery, stdout hygiene, error propagation, runaway timeout). Uses a stub dispatcher, so it needs no browser. |
+| `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner for a real host: apt deps (incl. Chromium libs + bubblewrap), `uv` **as the app user**, `uv sync --frozen`, `playwright install chromium`, nginx site + snippet + basic auth + rate limit, systemd unit, `/etc/bandshell/bandshell.env`, then smoke checks (app imports, Chromium renders, sandbox smoke test, `/api/health`, auth probe must return 401). Re-runnable; aborts at the first failing step. |
+| `docs/sandbox-plan.md` | Sandbox design + threat model + the bugs found during E2E verification. |
 | `scripter.py` | Prompt builders (`codegen_prompt`, `initial_*_message`) + code extraction helpers. |
 | `serialization.py` | Dataclass→API-dict serialization (`event_out`, `website_out`, ...) + `asset_url`, `current_settings_version`, `_parse_event_id`. |
 | `bot.py` | `Bot` class: HTTP client for the LLM (httpx), manages the tool-call loop. Every completion sends `max_tokens=8192` (runaway-generation guard). Timeout is `httpx.Timeout(connect=10, read=600, write=30, pool=10)` — the read budget is generous because a max-size generation at a slow provider can take minutes; a too-short read was silently dropping large-but-valid responses. 4-attempt retry: `_TransientError` (429 rate limit / 5xx, also HTTP-200-with-error bodies) backs off honoring `Retry-After` (capped at 30s); other failures retry with backoff; every attempt logs (elapsed + error) to `logs/llm_usage.jsonl` and success logs `finish=... in=... out=... elapsed=...`; total failure raises a descriptive `RuntimeError` (URL/status/body). Optional OpenRouter fallback models via `state.FALLBACK_MODELS` (env `OPENROUTER_FALLBACK_MODELS`, sent as the `models` array). Cancellation (`asyncio.CancelledError`) propagates. |
@@ -84,8 +86,33 @@ process memory (restart loses events, websites, scripts, settings).
 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-The app binds itself and mounts `/static`. Serve behind nginx/ngrok for external use;
-onboarding scripts run in-process against the same browser.
+The app binds itself and mounts `/static`.
+
+**Deployment (`deploy/install.sh`).** The supported server layout is nginx → uvicorn on
+loopback, provisioned by the script (idempotent — re-run after a `git pull`):
+
+```
+tunnel/Internet → nginx :8080 (basic auth, WS upgrade, rate limit) → 127.0.0.1:8000 (uvicorn, 1 worker)
+```
+
+Facts that matter when touching either side:
+
+- **Auth lives in nginx, not the app** (the app has no login). It's HTTP Basic on every
+  route via a shared snippet `/etc/nginx/snippets/<site>-proxy.conf`; browsers replay the
+  cached credentials on the WebSocket handshake, so the live view works unchanged.
+- **A tunnel must point at nginx**, never at `127.0.0.1:8000` — the latter skips the password.
+- **The proxy config lives in the snippet**, not inline in the site file, so both locations
+  (and any `certbot --nginx` rewrite) carry the same auth/WS/timeouts.
+- **`PORT` (8000) and `NGINX_PORT` (8080) are separate** on purpose; the installer detects a
+  competing site (same listen port, or a second `proxy_pass` to the app port) *before*
+  reloading nginx, because a failed reload leaves the old, unauthenticated site serving.
+- **The systemd unit must not set `NoNewPrivileges`/`ProtectSystem`** — bwrap needs user
+  namespaces. Uvicorn runs with `--workers 1` (all state is process-local) and
+  `--timeout-graceful-shutdown 10` (so SIGTERM still flushes storage to Sheets).
+- **Env comes from `/etc/bandshell/bandshell.env`** — see Config & secrets.
+
+The manual equivalent of what the installer generates (abbreviated — the real file also
+has auth, the `map` for `Connection`, `proxy_buffering off`, and the rate limit):
 
 **nginx + tunnel + WebSockets (important):** the embedded browser view
 (`/api/browser/{id}/ws`) needs WebSocket upgrade headers in the reverse proxy —
@@ -342,6 +369,28 @@ main.py       <- depends on everything; imports agents/serialization/state
 
 ## Current known issues / to verify
 
+- **Sandbox: implemented and verified in-process, not yet on a deployed host.** The smoke
+  test passes on both `SANDBOX_CLIENT` paths and a generated script drove a real Chromium
+  page through bwrap (see How to Run + `docs/sandbox-plan.md`). Still unproven on the real
+  server: running under systemd as the app user, and the timeout seatbelt killing a hung
+  run. Server runs should set `SCRIPT_SANDBOX=1` so isolation can't silently vanish.
+- **`deploy/install.sh` has never completed against a real root shell.** Every step was
+  rehearsed with stubbed `sudo`/`apt-get`/`systemctl`/`nginx`/`htpasswd` over a real
+  `uv sync` venv, which caught several real bugs (clobbered `PORT` default, a backtick in a
+  summary heredoc executing a command, `chown` aborting under `set -e`). The apt/systemd
+  paths are the remaining unknown; the script stops at the first failure with a message.
+- **No automated tests.** Verification is `py_compile`, `node --check`,
+  `tools/sandbox_smoke.py`, and the stubbed installer run. A pytest over `validate_script`,
+  `sandbox_framing`, and `serialization` would be cheap insurance.
+- **Unbounded runtime files.** `logs/llm_usage.jsonl` appends forever and `generated/` grows
+  by two files per codegen attempt; there is no rotation or cleanup yet (harmless on a
+  rare-use VM, worth adding before a long-lived one).
+- **Idle shutdown is designed but not implemented** (see the hosting discussion):
+  `AUTO_SHUTDOWN_MINUTES` (0 = off) + `/api/activity` + a guard that refuses to power off
+  while a browser stream is open or a runner is active + one sudoers line. Until then a VM
+  runs 24/7.
+- **TLS is untested** — the installer's `--domain` path runs certbot (and is skipped by
+  design when nginx isn't on `:80`), but no real Let's Encrypt issuance has been exercised.
 - **Script writing/execution was debugged and fixed** (double-generate in codegen, helper-fn
   validation, aria-strip, click-overlay retry, execution-failure rewrite loop). Verify end-to-end.
 - **Agent logs**: `logs/llm_usage.jsonl` records every LLM call (finish_reason, token counts,

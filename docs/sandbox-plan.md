@@ -230,24 +230,44 @@ input; everything else is host-enforced.
    machine*, so on a busy host it breaks thread creation. `--unshare-pid` already covers
    process escape.
 
-## 6. What to verify on the VM (can't run here — no bwrap/playwright)
+## 6. Verification status
 
-1. bwrap exists + `--unshare-net` + `--die-with-parent` behave on the 1GB VM; confirm
-   the `--tmpfs /` ordering with a trivial `python -S -c 'print(1+1)'`.
-2. Bootstrap over MCP: the child fetches its job via the `get_job` tool (no fd tricks),
-   and `report` returns the outcome before it exits.
-3. MCP stdio framing both ways: host `Server.run` bound to child pipes, sandbox
-   fastmcp `Client` over own stdin/stdout — an end-to-end script that fills one field on
-   the review page.
-4. The execution-timeout seatbelt: `asyncio.wait_for(self._child.wait(), 120)` + kill on
-   a `while True` script; confirm no hung context remains, no leaked Playwright page.
-5. Confirm `scripting.run_script_against_event` reviewer flow (LIVE_PAGES registration +
-   embed + Done) is byte-identical when running via sandbox vs in-process.
+Rehearsed in a real environment (bwrap 0.13.1 + uv-managed CPython 3.12.15 + fastmcp 3.4.4
++ mcp 1.28.1 + Chromium): items 1–3 **pass**, on both `SANDBOX_CLIENT` paths, with all 12
+`tools/sandbox_smoke.py` checks green. Items 4–5 need the real deployment (systemd, the
+review flow against a live site), hence still open.
 
-## 7. Docs to update when it ships
-- README.md: sandboxing paragraph (bwrap + stdio, env, `SCRIPT_SANDBOX`, "not supported
-  on WSL-without-bwrap" fallback = in-process path under flag).
-- AGENTS.md: replace the "planned future: sandboxed separate process" line with the real
-  component names; note the stderr-only rule for the runner's non-MCP output.
-- AGENTS.md security section: note the framing inversion (host=server) so future agents
-  don't re-litigate stdio vs HTTP.
+| # | Check | Status |
+|---|-------|--------|
+| 1 | bwrap flags, `--unshare-net`, `--die-with-parent`, `--tmpfs /` ordering | ✅ verified |
+| 2 | Bootstrap over MCP (`get_job` / `report`, no fd tricks) | ✅ verified |
+| 3 | MCP stdio framing both ways; script fills a real page field | ✅ verified |
+| 4 | Timeout seatbelt kills a `while True` script, no hung context | ⬜ smoke-tested with a stub dispatcher only |
+| 5 | Reviewer flow identical via sandbox vs in-process (LIVE_PAGES, embed, Done) | ⬜ needs a real onboarding |
+
+## 7. Docs (updated when it shipped)
+
+Done, keep in sync:
+
+- `README.md` — sandboxing paragraph (bwrap + stdio, env vars, `SCRIPT_SANDBOX`), the
+  installer section, and the troubleshooting table (`exit 137` → `SANDBOX_CLIENT=mcp`).
+- `AGENTS.md` — the real component names (`sandbox_framing` / `sandbox_host` /
+  `sandbox_runner`), the stderr-only rule for the runner's non-MCP output, and the framing
+  inversion (**host = MCP server**, child = client) so nobody re-litigates stdio vs HTTP.
+
+### Bugs this plan did not anticipate (found during E2E)
+
+1. **bubblewrap has no `--rlimit-*` flags** — limits are applied inside the runner via
+   `resource.setrlimit()` (soft == hard).
+2. **mcp 1.28's `@server.call_tool` decorator calls `func(name, arguments)`**, not
+   `func(request)`. The wrong signature raised `TypeError` inside the SDK, the body never
+   ran, and the resulting error response deadlocked the client's framer
+   (`anyio.wrap_file` + blocking `readline` on an uncancellable thread) → the run hung and
+   was killed as `137` with no traceback. Two fixes: correct handler signature, and
+   `loop.connect_read_pipe` / `connect_write_pipe` instead of wrapping `sys.stdin`.
+3. **A uv-managed interpreter lives outside `/usr`**, and the venv symlink chain hops
+   through a version-less directory (`cpython-3.12-…` → `cpython-3.12.15-…`). `_sandbox_argv`
+   walks the chain and ro-binds every non-`/usr` prefix at its literal path.
+4. **`SANDBOX_ERROR_PREFIX` has to be the first token** of the message, or `agents.py`'s
+   `startswith()` check misses it and infra failures get handed to the LLM as script bugs
+   (8 pointless rewrites).
