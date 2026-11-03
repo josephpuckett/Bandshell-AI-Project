@@ -39,7 +39,6 @@
 #   sudo bash deploy/install.sh --auth-user steve     # prompted for a password
 #   sudo bash deploy/install.sh --nginx-port 80       # default is 8080
 #   sudo bash deploy/install.sh --port 9000           # uvicorn port
-#   sudo bash deploy/install.sh --domain events.example.org --email you@example.org
 #   sudo bash deploy/install.sh --env-file ~/bandshell.env   # secrets from a file
 #   sudo bash deploy/install.sh --google-key ~/sheets-key.json
 #   sudo bash deploy/install.sh --auto-shutdown 60    # power off after 60 min idle
@@ -59,8 +58,6 @@ PORT="${PORT:-8000}"                 # uvicorn (loopback only)
 NGINX_PORT="${NGINX_PORT:-8080}"     # nginx listen port (firewall/tunnel target)
 SERVER_NAME="${SERVER_NAME:-_}"      # nginx server_name; "_" = catch-all
 SITE_NAME="${SITE_NAME:-bandshell}"
-DOMAIN="${DOMAIN:-}"                 # set → configure certbot TLS for this name
-EMAIL="${EMAIL:-}"                   # required with DOMAIN
 APP_USER="${APP_USER:-}"             # default: owner of the project directory
 AUTH_ENABLED=1                       # nginx basic auth (strongly recommended)
 AUTH_USER="${AUTH_USER:-bandshell}"  # login name
@@ -110,8 +107,6 @@ while [ $# -gt 0 ]; do
         --port)           PORT="${2:?}"; shift 2 ;;
         --nginx-port)     NGINX_PORT="${2:?}"; shift 2 ;;
         --server-name)    SERVER_NAME="${2:?}"; shift 2 ;;
-        --domain)         DOMAIN="${2:?}"; shift 2 ;;
-        --email)          EMAIL="${2:?}"; shift 2 ;;
         --user)           APP_USER="${2:?}"; shift 2 ;;
         --site-name)      SITE_NAME="${2:?}"; shift 2 ;;
         --auth-user)      AUTH_USER="${2:?}"; shift 2 ;;
@@ -148,10 +143,6 @@ if [ -z "$APP_HOME" ] || [ ! -d "$APP_HOME" ]; then
 fi
 if [ "$APP_USER" = "root" ]; then
     warn "project is owned by root; the service will run as root. Consider --user <name>"
-fi
-
-if [ -n "$DOMAIN" ] && [ -z "$EMAIL" ]; then
-    die "--domain needs --email (for certbot registration)"
 fi
 
 if [ -n "${AUTH_PASSWORD:-}" ] && [ -z "$AUTH_PASS" ]; then
@@ -325,9 +316,6 @@ ok "Chromium installed for $APP_USER"
 # --------------------------------------------------------------------------- #
 step "Configuring nginx"
 NGINX_CONF="/etc/nginx/sites-available/${SITE_NAME}.conf"
-if [ -n "$DOMAIN" ]; then
-    SERVER_NAME="$DOMAIN"
-fi
 
 # --- credentials ----------------------------------------------------------- #
 if [ "$AUTH_ENABLED" = "1" ]; then
@@ -374,10 +362,8 @@ if [ "$AUTH_ENABLED" = "1" ]; then
 
     # The file has to exist before nginx starts serving this site.
     [ -s "$HTPASSWD_FILE" ] || die "missing $HTPASSWD_FILE"
-    if [ -z "$DOMAIN" ]; then
-        warn "Basic auth over plain HTTP sends the password in clear text."
-        warn "Use --domain <name> (TLS via certbot) or a tunnel for anything public."
-    fi
+    warn "Basic auth over plain HTTP sends the password in clear text — for anything"
+    warn "  public, put a tunnel in front (ngrok, see NGROK_URL below) or a TLS proxy."
 else
     warn "=============================================================="
     warn " Running WITHOUT authentication (--no-auth)."
@@ -455,10 +441,6 @@ server {
 }
 NGINX
 
-if [ -n "$DOMAIN" ]; then
-    apt-get install -y -qq certbot python3-certbot-nginx >/dev/null || \
-        warn "could not install certbot; run it manually for TLS"
-fi
 ln -sfn "$NGINX_CONF" "/etc/nginx/sites-enabled/${SITE_NAME}.conf"
 # The distro default claims "server_name _;" on :80 and would shadow us — but
 # only when we listen on :80 ourselves (on 8080 it's harmless, and a stray
@@ -890,7 +872,7 @@ if [ "${NGROK_ACTIVE:-0}" = "1" ]; then
     FIREWALL_HINT="  6. Firewall: only SSH needs to be open now — ngrok reaches nginx from
      this machine's own loopback, so ${NGINX_PORT} can stay closed to the internet."
 else
-    FIREWALL_HINT="  6. Firewall: allow inbound ${NGINX_PORT} (and 443 if you add TLS), or keep it
+    FIREWALL_HINT="  6. Firewall: allow inbound ${NGINX_PORT}, or keep it
      closed and point a tunnel at it. Do NOT expose ${PORT}."
 fi
 if [ -n "${_idle_min:-}" ] && [ "$(awk -v v="$_idle_min" 'BEGIN{print (v+0>0)?1:0}')" = "1" ]; then
@@ -1096,23 +1078,4 @@ $(printf '%sWARNING:%s the login was NOT verified as enforced.' "$c_red" "$c_res
     sudo grep -rn "proxy_pass.*:${PORT}" /etc/nginx/
     curl -sI http://127.0.0.1/api/settings        # expect: HTTP/1.1 401
 SUMMARY
-fi
-
-if [ -n "$DOMAIN" ]; then
-cat <<SUMMARY
-
-  TLS: run once certificates are resolvable —
-    sudo apt-get install -y certbot python3-certbot-nginx
-    sudo certbot --nginx -d ${DOMAIN} --redirect -m ${EMAIL} --agree-tos -n
-SUMMARY
-fi
-
-if [ -n "$DOMAIN" ] && [ "$NGINX_PORT" != "80" ]; then
-    warn "certbot --nginx expects the site on :80 (HTTP-01 challenge + redirect)."
-    warn "Re-run with --nginx-port 80, or issue the cert manually (DNS challenge)."
-elif [ -n "$DOMAIN" ] && command -v certbot >/dev/null 2>&1; then
-    step "Requesting TLS certificate"
-    certbot --nginx -d "$DOMAIN" --redirect -m "$EMAIL" --agree-tos -n \
-        && ok "https configured for $DOMAIN" \
-        || warn "certbot failed; HTTP only for now (re-run manually)"
 fi

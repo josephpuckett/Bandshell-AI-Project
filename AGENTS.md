@@ -32,7 +32,9 @@ process memory (restart loses events, websites, scripts, settings).
 | `sandbox_runner.py` | Sandbox side: the only code executed inside bwrap. A `fastmcp.Client` over its **own** stdin/stdout (inverted stdio — it cannot spawn), fetches `get_job`, `exec`s the script in a scrubbed namespace, forwards each `api.*` as an MCP `tools/call`, reports the outcome, exits. **stdout is the wire** — script output is redirected to stderr. |
 | `tools/idle_smoke.py` | 7-scenario smoke test for the idle watchdog (no browser, no network; each scenario runs in its own subprocess because `idle.py` holds module-level state). |
 | `tools/sandbox_smoke.py` | VM smoke test for the sandbox bridge (bwrap flags, fd/pipe inheritance, framing both ways, event delivery, stdout hygiene, error propagation, runaway timeout). Uses a stub dispatcher, so it needs no browser. |
+| `bootstrap.sh` (repo root) | Wrapper for a fresh VM: updates packages, installs git, clones/fast-forwards the checkout, `chown`s it to the app user, then execs `deploy/install.sh` with the rest of its arguments. Re-running = upgrade path. |
 | `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner for a real host: apt deps (incl. Chromium libs + bubblewrap), `uv` **as the app user**, `uv sync --frozen`, `playwright install chromium`, nginx site + snippet + basic auth + rate limit, systemd unit, env file (`--env-file`, BOM/CRLF-normalised), Google key (`--google-key`, 0640 root:appgroup), sudoers rule for idle shutdown, optional **ngrok** (apt repo + authtoken + `ngrok.service` after the app), then smoke checks (app imports, Chromium renders, sandbox smoke test, `/api/health`, auth probe must return 401, public-URL probe must return 401). Re-runnable; aborts at the first failing step. |
+| `docs/deploy.md` | Operator-facing documentation: install (`bootstrap.sh` / `install.sh`), env settings, persistence, ngrok, idle shutdown, logs, troubleshooting. It is the source of truth for anything a *human* does on a server; `README.md` stays end-user oriented. |
 | `docs/sandbox-plan.md` | Sandbox design + threat model + the bugs found during E2E verification. |
 | `scripter.py` | Prompt builders (`codegen_prompt`, `initial_*_message`) + code extraction helpers. |
 | `serialization.py` | Dataclass→API-dict serialization (`event_out`, `website_out`, ...) + `asset_url`, `current_settings_version`, `_parse_event_id`. |
@@ -101,8 +103,12 @@ uvicorn main:app --host 127.0.0.1 --port 8000
 
 The app binds itself and mounts `/static`.
 
-**Deployment (`deploy/install.sh`).** The supported server layout is nginx → uvicorn on
-loopback, provisioned by the script (idempotent — re-run after a `git pull`):
+**Deployment.** Operator-facing docs (install, settings, logs, cost control,
+troubleshooting) live in **`docs/deploy.md`**; the summary below is what a coding agent
+needs to know before touching either side.
+
+**`deploy/install.sh`** provisions the supported layout — nginx → uvicorn on loopback —
+and is idempotent (re-run after a `git pull`):
 
 ```
 tunnel/Internet → nginx :8080 (basic auth, WS upgrade, rate limit) → 127.0.0.1:8000 (uvicorn, 1 worker)
@@ -115,13 +121,19 @@ Facts that matter when touching either side:
   cached credentials on the WebSocket handshake, so the live view works unchanged.
 - **A tunnel must point at nginx**, never at `127.0.0.1:8000` — the latter skips the password.
 - **The proxy config lives in the snippet**, not inline in the site file, so both locations
-  (and any `certbot --nginx` rewrite) carry the same auth/WS/timeouts.
+  always carry the same auth/WS/timeouts (one place to audit, nothing to duplicate).
 - **`PORT` (8000) and `NGINX_PORT` (8080) are separate** on purpose; the installer detects a
   competing site (same listen port, or a second `proxy_pass` to the app port) *before*
   reloading nginx, because a failed reload leaves the old, unauthenticated site serving.
 - **The systemd unit must not set `NoNewPrivileges`/`ProtectSystem`** — bwrap needs user
   namespaces. Uvicorn runs with `--workers 1` (all state is process-local) and
   `--timeout-graceful-shutdown 10` (so SIGTERM still flushes storage to Sheets).
+- **A sudo-run wrapper must never pass `~` or `$HOME` paths.** Both resolve to `/root` inside
+  the script, so `--env-file ~/bandshell.env` fails with `cannot read --env-file
+  /root/bandshell.env` even though the file is right there in the user's home. The wrapper
+  sets `USER_HOME` — hardcoded to the admin's home (`/home/info`), which is the normal
+  single-admin case — and passes quoted absolute paths. `docs/deploy.md` shows the
+  `getent passwd "${SUDO_USER:-$(id -un)}"` variant for when a different account runs it.
 - **Env comes from `/etc/bandshell/bandshell.env`** — see Config & secrets. `--env-file`
   installs a downloaded file (normalising BOM/CRLF, reporting non-`KEY=VALUE` lines, backing
   up the old one to `.bak`); it never appends a second `AUTO_SHUTDOWN_MINUTES` because
@@ -417,37 +429,32 @@ main.py       <- depends on everything; imports agents/serialization/state
 
 ## Current known issues / to verify
 
-- **Sandbox: implemented and verified in-process, not yet on a deployed host.** The smoke
-  test passes on both `SANDBOX_CLIENT` paths and a generated script drove a real Chromium
-  page through bwrap (see How to Run + `docs/sandbox-plan.md`). Still unproven on the real
-  server: running under systemd as the app user, and the timeout seatbelt killing a hung
-  run. Server runs should set `SCRIPT_SANDBOX=1` so isolation can't silently vanish.
-- **`deploy/install.sh` has never completed against a real root shell.** Every step was
-  rehearsed with stubbed `sudo`/`apt-get`/`systemctl`/`nginx`/`htpasswd` over a real
-  `uv sync` venv, which caught several real bugs (clobbered `PORT` default, a backtick in a
-  summary heredoc executing a command, `chown` aborting under `set -e`). The apt/systemd
-  paths are the remaining unknown; the script stops at the first failure with a message.
-- **No automated tests.** Verification is `py_compile`, `node --check`,
-  `tools/sandbox_smoke.py`, and the stubbed installer run. A pytest over `validate_script`,
-  `sandbox_framing`, and `serialization` would be cheap insurance.
+- **Verified on a real Debian VM:** `deploy/install.sh` end to end, the app surviving
+  systemd restarts with Google Sheets persistence, idle shutdown powering the host off, and
+  Eventbrite draft creation. Everything below is what is *still* soft.
+- **Sandbox: verified in-process, and on the server only via `SCRIPT_SANDBOX=auto`.** The
+  smoke test passes on both `SANDBOX_CLIENT` paths and a generated script drove a real
+  Chromium page through bwrap (see How to Run + `docs/sandbox-plan.md`). Not separately
+  re-verified on the host: systemd + app user, and the wall-clock kill of a hung run. Set
+  `SCRIPT_SANDBOX=1` on a server so a broken sandbox fails loudly instead of silently
+  falling back to in-process.
+- **No automated tests** — this is the next piece of work. Verification today is
+  `py_compile`, `node --check`, `tools/sandbox_smoke.py`, `tools/idle_smoke.py` and manual
+  runs. Start a `tests/` with `validate_script` (the security boundary), `serialization`,
+  `idle.tick` and `sandbox_framing`, then a CI workflow running those + `py_compile` +
+  `node --check`.
 - **Unbounded runtime files.** `logs/llm_usage.jsonl` appends forever and `generated/` grows
-  by two files per codegen attempt; there is no rotation or cleanup yet (harmless on a
-  rare-use VM, worth adding before a long-lived one).
-- **Idle shutdown is implemented and verified in-process, not on a real VM.** All 7
-  `tools/idle_smoke.py` scenarios pass, the middleware/endpoint/broadcast were exercised
-  against a live uvicorn, and the installer writes the sudoers rule (validated with
-  `visudo -c -f`). Unproven on a host: the actual power-off (i.e. that the sudoers rule
-  matches the command) and that SIGTERM's graceful shutdown flushes Sheets. Test there with
-  `AUTO_SHUTDOWN_DRY_RUN=1` first. Design notes are in `idle.py`'s docstring.
-- **TLS is untested** — the installer's `--domain` path runs certbot (and is skipped by
-  design when nginx isn't on `:80`), but no real Let's Encrypt issuance has been exercised.
-- **Script writing/execution was debugged and fixed** (double-generate in codegen, helper-fn
-  validation, aria-strip, click-overlay retry, execution-failure rewrite loop). Verify end-to-end.
+  by two files per codegen attempt; no rotation (documented in `docs/deploy.md` as a
+  `find … -mtime +30 -delete` chore rather than automated).
+- **Script writing/execution** was debugged and fixed (double-generate in codegen, helper-fn
+  validation, aria-strip, click-overlay retry, execution-failure rewrite loop); confirmed
+  working end-to-end on the server.
 - **Agent logs**: `logs/llm_usage.jsonl` records every LLM call (finish_reason, token counts,
   elapsed) incl. failed attempts, and `logs/*.jsonl` captures full onboarding/task transcripts
   (JSONL, one message per line — tool calls and results included). This is a local source of
   truth that survives OpenRouter dashboard cleanup.
-- **Eventbrite + Sheets are new and untested** — nothing here has been integration-tested.
+- **Eventbrite + Sheets are exercised** (drafts created; state survives restarts). Not
+  covered: Eventbrite image upload edge cases and a sheets schema change.
 - `Driver.fill()` already auto-detects select/checkbox/fill (mirrors the manual agent);
   remaining edge cases are dates/images may need special handling.
 - **LLM runaway-generation guard is in place** (`bot.py` `max_tokens=8192` + generous read
@@ -463,6 +470,17 @@ main.py       <- depends on everything; imports agents/serialization/state
   (`actionsSig`/`scriptsSig`) — keep that working. Tooltips open on hover only (a focus
   trigger made them flash open when a dialog opened). The help `?`, legend, and dialog
   markup must stay balanced (quick HTML tag check catches regressions).
+
+## Roadmap / deliberately not built
+
+- **Tests + CI** (see above) — the one thing most worth doing next.
+- **Video instead of JPEG frames** for the live view: CDP screencast only emits stills.
+  A WebRTC/CDP-screencast-to-video path would cut bandwidth, at a large complexity cost.
+- **Pre-agentic fill actions**: let a human record a few manual steps before the agent takes
+  over, instead of the agent starting from the login page every time.
+- **No TLS in the installer.** Deliberately removed: `--domain`/certbot only works when
+  nginx is on `:80`, and the supported deployment fronts nginx with a tunnel (ngrok
+  terminates TLS). Use a TLS-terminating proxy if you need HTTPS without a tunnel.
 
 ## Storage (Google Sheets, optional)
 

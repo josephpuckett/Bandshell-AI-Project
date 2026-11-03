@@ -1,313 +1,97 @@
 # Bandshell Calendar
 
-A FastAPI web app that partially automates publishing nonprofit events to other
-organizations' online calendars. An AI agent acts as a "browser operator" through a
-one-time guided setup, then a reusable script fills the same form for every future event.
+A small web app that gets your nonprofit's events onto **other organizations' calendars**
+without re-typing them into every form.
 
-**Status: demo / prototype.** All state is in-memory (a restart loses events, websites,
-scripts, and settings). Optional Google Sheets persistence and an Eventbrite API path
-exist but are lightly tested.
+You show it one website's event form once. An AI fills that form in a browser while you
+watch, you approve the result, and the app saves a reusable *routine*. Every event after
+that takes about two minutes: it fills the form, you check it, **you** press submit.
+
+> **It never publishes anything by itself.** The app types; a human decides.
 
 ## How it works
 
-1. **An AI agent** (LLM) uses Playwright to manually navigate to the calendar website and
-   fill in the event form — you can watch it live in the embedded browser view.
-2. **A human approves** the manual attempt in the UI (and can fix fields, solve captchas,
-   and submit from the embedded view).
-3. The agent writes a **reusable Python script** from the steps it took, parameterized by
-   the `Event` class — no LLM needed for subsequent runs.
-4. The script runs against the browser; you **review and submit manually**.
-5. Future events for that site just run the saved script.
+```
+ 1. you create an event     2. you add the website     3. one-time setup        4. every event after
+ ─────────────────────      ──────────────────────     ─────────────────       ──────────────────
+ title, dates, blurb,   →   the calendar you submit →  an AI fills the form  →  the saved routine
+ description, image         to (once, not per event)   live; you fix and        fills it in ~2 min;
+                                                       approve it               you review + submit
+```
 
-The workflow is *scripted, not automated*: nothing is ever published without a human
-looking at it.
+Step 3 is the only slow one (5–15 minutes, once per website). It's also where the app
+learns: it records the clicks and typing that worked and replays them next time, with no
+AI involved.
 
-## Quick start
+## What you need
 
-Requirements: Python 3.12 with the deps in `pyproject.toml`, plus:
+- A browser (Chrome, Edge, Firefox, Safari) — a laptop or desktop, not a phone.
+- The link to the app plus the username/password from whoever runs it.
+- The event details you'd type by hand anyway: title, date and times, a short blurb, a
+  longer description, ticket price, and **a link to an image anyone can open** (Google
+  Drive: right-click → Share → *Anyone with the link* → *Viewer*).
+- The calendar website's own login, if it has one — you may need to type it into the live
+  page during setup. That's normal.
 
-- `OPENROUTER_API_KEY` — LLM calls go to OpenRouter (model configured in `state.py`)
-- Chromium — Playwright's browser (`BROWSER=firefox` switches engines; Firefox loses the
-  CDP screencast, so the live view falls back to slower per-frame screenshots)
+## Using it
+
+1. **+ New Event** — fill in the event. Venue, cost and categories come from Settings.
+2. **+ Website** — where events should go (once per calendar website).
+3. **Set up this website** — watch the live page, help when needed (a login, a captcha),
+   then **Approve**. If it's wrong, **Reject** with a short note and it tries again.
+4. **Review and submit** — the routine fills the form; check it, press the site's own
+   submit button in the live page, then **✓ Done**.
+
+A longer plain-English guide with a glossary and troubleshooting ships with the app at
+**`/static/user-guide.html`** (also linked from the **?** button).
+
+## Good to know
+
+- **The live page is a stream of images**, not a real browser window you can copy from.
+  You *can* click, type and scroll it, and paste with <kbd>Ctrl</kbd>+<kbd>V</kbd>.
+  Date pickers and dropdowns drawn by the browser itself can't be shown — type instead.
+- **One event per run.** Finish and click Done before starting the next.
+- **Badges:** *Not set up* → *Setting up* → *Ready*. *Stale* means the shared settings
+  (venue, cost, categories) changed, so the routine needs re-learning.
+- **Eventbrite** websites are different: events are created there as **drafts** for you to
+  publish — no browser, no review step.
+
+## Running it yourself
+
+Locally, for development:
 
 ```bash
-apt-get install bubblewrap          # optional: script sandbox (recommended)
-uv sync                             # creates .venv from uv.lock (CPython 3.12)
+apt-get install bubblewrap                 # optional but recommended: script sandbox
+uv sync                                    # creates .venv from uv.lock (Python 3.12)
 .venv/bin/playwright install --with-deps chromium
-HEADLESS=1 uvicorn main:app --host 127.0.0.1 --port 8000
+OPENROUTER_API_KEY=sk-or-... HEADLESS=1 uvicorn main:app --port 8000
 ```
 
-A visible browser window opens on the machine running the app unless `HEADLESS=1`. Then
-open `http://127.0.0.1:8000`, create an Event, add a Website, and run through the guided
-setup.
-
-For an actual server, skip the steps above and use `deploy/install.sh` (next section) —
-it does all of this, plus nginx, auth, and systemd.
-
-### Optional configuration (env vars)
-
-| Variable | Effect |
-|----------|--------|
-| `OPENROUTER_FALLBACK_MODELS` | Comma-separated fallback models used when the primary is rate-limited |
-| `BROWSER` | Playwright engine: `chromium` (default) or `firefox`. Chromium enables the live view's CDP screencast streaming (see below); Firefox falls back to per-frame screenshots |
-| `HEADLESS` | `1` runs the Playwright browser without a visible window (needed on headless servers) |
-| `BROWSER_FPS` | Live-view target frame rate (default `4`, max `60`). A ceiling — the actual rate is bounded by the CDP/screenshot pipeline and the VM's CPU; unchanged frames are deduped anyway |
-| `BROWSER_JPEG_QUALITY` | Live-view JPEG quality (default `80`, range 30–95). Lower = faster encode + smaller frames (the encode is the CPU floor on small VMs); a small visual cost in the watching view |
-| `EVENTBRITE_TOKEN` | Enables Eventbrite API websites (draft events, no publishing) |
-| `SCRIPT_SANDBOX` | Script isolation: `auto` (default — bubblewrap when installed, else in-process), `1`/`require` (require bwrap), `0` (always in-process). Install with `apt-get install bubblewrap` |
-| `BWRAP` / `SANDBOX_TIMEOUT` | bwrap binary path (default `bwrap`) / per-run wall-clock limit in seconds (default 120) |
-| `SANDBOX_CLIENT` | MCP client used *inside* the sandbox: `auto` (default — fastmcp if it imports, else the `mcp` SDK), `fastmcp`, or `mcp` (lightest; use if sandboxed runs die with `exit 137`) |
-| `SANDBOX_CPU_SECONDS` / `SANDBOX_MAX_MEMORY_MB` | Per-run ceilings applied inside the sandbox (default 30 s / 1024 MB) |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` + `EVENTS_SPREADSHEET_ID` | Google Sheets persistence (Events / Websites / Settings worksheets) |
-| `AUTO_SHUTDOWN_MINUTES` | **Power the host off after this many idle minutes** (`0` = off, the default). The UI's 1s polls don't count as activity, so a forgotten tab can't keep a VM billing; fractions allowed (`0.5`) for testing |
-| `AUTO_SHUTDOWN_MAX_HOURS` | Escape hatch: power off after this much uptime even if work is in flight (`0` = never force) |
-| `AUTO_SHUTDOWN_DRY_RUN` | `1` logs the shutdown decision instead of powering off — watch the timer work |
-| `AUTO_SHUTDOWN_COMMAND` | What to run (default `sudo -n /usr/sbin/shutdown -h now`); the installer writes the matching sudoers rule |
-| `NGROK_URL` + `NGROK_AUTHTOKEN` | Read by `deploy/install.sh`, not the app: when both are set it installs ngrok and runs `ngrok http <nginx port> --url <NGROK_URL>` as `ngrok.service` |
-
-(The browser engine is set via the `BROWSER` env var, default `chromium`.)
-
-### Deploying on a server (Debian/Ubuntu)
-
-`deploy/install.sh` provisions a host end to end: system packages, `uv`, the
-Python deps (from `uv.lock`), Playwright's Chromium, an nginx site with
-**HTTP Basic auth on by default**, and a systemd unit running uvicorn on
-loopback. Put secrets in `/etc/bandshell/bandshell.env`.
+On a server (Debian/Ubuntu), keep a small `bootstrap.sh` next to your downloaded
+`bandshell.env` and Google key. It updates the system, installs `git`, clones or
+fast-forwards the project, and then runs `deploy/install.sh` — which sets up nginx with a
+login, the systemd service, and the optional public URL:
 
 ```bash
-sudo bash deploy/install.sh --auth-user you --nginx-port 8080
+# edit REPO / DIR / APP_USER at the top of bootstrap.sh, then:
+sudo bash bootstrap.sh
 ```
 
-**Hand it your secrets instead of typing them in.** Download the env file and the
-Google service-account key, then:
+`USER_HOME` in that script is what points `--env-file`/`--google-key` at *your* downloads;
+under `sudo`, `~` and `$HOME` both mean `/root`. Re-running it is the upgrade path.
 
-```bash
-sudo bash deploy/install.sh --auth-user you --nginx-port 8080 \
-     --env-file ~/bandshell.env --google-key ~/sheets-key.json
-```
+See **[docs/deploy.md](docs/deploy.md)** for install options, settings, logs, idle
+shutdown, the optional tunnel and troubleshooting.
 
-`--env-file` installs that file as `/etc/bandshell/bandshell.env` (mode 600,
-previous one kept as `.bak`). It normalises what downloads usually bring — a UTF-8
-BOM and Windows/Drive CRLF line endings (a stray `\r` silently corrupts the last
-character of every value, e.g. your API key) — and reports lines that aren't
-`KEY=VALUE` instead of shipping a file systemd can't read. `--google-key` installs
-the service-account JSON at `/etc/bandshell/google-service-account.json` (mode 0640,
-readable by the app user) and points `GOOGLE_SERVICE_ACCOUNT_JSON` at it.
+## Docs
 
-**Environment variables go in `/etc/bandshell/bandshell.env`** (created by the
-installer, mode 600). It is read by the systemd unit — systemd does *not* inherit
-your shell, and a `.env` file in the repo is not read, because the app uses
-`os.getenv()` at import time. Format is literal `KEY=VALUE` lines:
-
-```ini
-OPENROUTER_API_KEY=sk-or-v1-...
-HEADLESS=1
-SCRIPT_SANDBOX=1
-```
-
-Two things worth knowing about that file: **a plain re-run never changes an existing
-web password** (`--auth-pass 'new'` is how you rotate it), and **systemd's
-`EnvironmentFile` has no inline comments** — `AUTO_SHUTDOWN_MINUTES=30  # thirty`
-sets the value to `30  # thirty`. The installer warns about both, and the app logs
-`[config] ignoring invalid …` and falls back to the default rather than crash-loops.
-
-Then `sudo systemctl restart bandshell`. To check what the running process
-actually sees:
-
-```bash
-curl -s http://127.0.0.1:8000/api/health
-# {"ok":true,"llm_configured":true,"storage_backend":"MemoryStorage",...}
-```
-
-`/api/health` reports booleans only (never values), so it is safe to expose.
-
-The installer is idempotent — re-run it after a `git pull` to refresh deps and configs.
-It refuses to leave a competing nginx site enabled: if another config listens on the same
-port or proxies to the same uvicorn port, it names the file to remove before reloading
-(a failed reload would leave the old, *unauthenticated* site serving).
-
-#### What it sets up
-
-| Piece | Result |
+| Where | What |
 |---|---|
-| nginx | listens on `--nginx-port` (default **8080**), proxies to `127.0.0.1:8000`, WebSocket upgrade + 3600s timeouts for the live view |
-| auth | HTTP Basic on **every** route (the app has no login of its own); password in `/etc/nginx/bandshell.htpasswd` |
-| rate limit | `6r/m` + burst 3 on the two endpoints that cost money (`…/onboard`, `…/run`) |
-| systemd | `bandshell.service`, `--workers 1`, restarts always, reads `/etc/bandshell/bandshell.env` |
-| sandbox | installs `bubblewrap`; set `SCRIPT_SANDBOX=1` in the env file so a broken sandbox fails loudly instead of silently running scripts unsandboxed |
-| idle shutdown | writes `/etc/sudoers.d/bandshell-shutdown` (only `shutdown -h now`/`poweroff`, only for the app user, no password) so the app can power the host off when idle — enabled with `--auto-shutdown N` or `AUTO_SHUTDOWN_MINUTES` in the env file |
+| `frontend/user-guide.html` | long-form guide for the person using the app (served at `/static/user-guide.html`) |
+| [docs/deploy.md](docs/deploy.md) | running it on a server: install, settings, operations, troubleshooting |
+| [AGENTS.md](AGENTS.md) | how the code works — architecture, modules, invariants (written for AI coding agents) |
+| [docs/sandbox-plan.md](docs/sandbox-plan.md) | why generated scripts run inside bubblewrap, and the threat model |
 
-### Idle shutdown (cost control)
+## License
 
-The app can power its host off after a period of genuine inactivity — useful when it's
-used a few times a month but would otherwise bill 24/7. Enable it in the env file:
-
-```ini
-AUTO_SHUTDOWN_MINUTES=60
-```
-
-What counts as activity: loading the app, creating/editing anything, pressing
-Approve/Reject/Done, and **any** interaction with the live browser view (clicks, typing,
-scroll, paste). What doesn't: the website panel's 1s poll, `/api/health` and
-`/api/activity` — so a forgotten browser tab can't keep the machine awake.
-
-It refuses to power off while work is in flight: an agent or script runner still
-running, a website waiting for your approval, or a scripted run's review page you
-haven't submitted. For a genuinely abandoned review page, `AUTO_SHUTDOWN_MAX_HOURS`
-forces the issue after that much uptime.
-
-```bash
-# watch it without risking a surprise power-off:
-#   AUTO_SHUTDOWN_DRY_RUN=1   (then)  sudo systemctl restart bandshell
-curl -s http://127.0.0.1:8000/api/activity
-# {"enabled":true,"idle_seconds":312.0,"busy":false,
-#  "would_shut_down_in_seconds":2880.0,"auto_shutdown_minutes":60.0,...}
-sudo journalctl -u bandshell | grep 'idle shutdown'
-```
-
-A powered-off instance must be started again (`gcloud compute instances start <vm>`,
-console, or a Cloud Scheduler job). The app's state survives if Google Sheets
-persistence is configured; otherwise in-memory state is lost with the power-off.
-
-
-### A public URL with ngrok
-
-Put `NGROK_URL` and `NGROK_AUTHTOKEN` in the env file (same file as everything
-else) and the installer does the rest — apt repo, authtoken, and a `ngrok.service`
-that starts *after* the app:
-
-```ini
-NGROK_URL=https://your-name.ngrok-free.app
-NGROK_AUTHTOKEN=2abc...            # ngrok dashboard → Your Authtoken
-```
-
-It runs `ngrok http 8080 --url <NGROK_URL>` against **nginx**, so the password and
-the WebSocket upgrade still apply; the final check probes the public URL and
-requires **401**. `--no-ngrok` skips it; `--ngrok-url`/`--ngrok-authtoken` override
-the file. Notes:
-
-The apt suite is **hardcoded to `bookworm`**, because that's what ngrok publishes
-(`bookworm`/`bullseye`; ask for `dists/trixie/Release` and you get a 404, which makes
-`apt-get update` fail on Debian 13). The agent is a static binary, so the bookworm
-package is fine on newer releases. If apt can't serve it at all, the installer falls
-back to ngrok's official static tarball in `/usr/local/bin`. Override with
-`--ngrok-repo-suite <suite>` if they ever publish more.
-
-- `--url` needs a **reserved** domain (free plans include one static domain).
-- If the tunnel won't stay up, `journalctl -u ngrok -n 40`: `ERR_NGROK_334` means
-  that domain is already claimed by another running agent.
-- Once ngrok is the front door, only **SSH** needs to be open in the cloud firewall.
-
-### Serving externally
-
-The embedded live browser view uses a WebSocket (`/api/browser/{id}/ws`). The frontend
-derives the WS URL from the page host, so any tunnel (ngrok, Cloudflare, Tailscale) works
-without code changes — **but it must point at nginx, not at uvicorn**:
-
-```bash
-tunnel → http://127.0.0.1:8080   # nginx: auth + WebSocket upgrade
-             ↓
-        127.0.0.1:8000         # uvicorn: loopback only, no auth
-```
-
-A tunnel aimed straight at `127.0.0.1:8000` bypasses the password entirely. Everything the
-proxy needs is in `/etc/nginx/snippets/bandshell-proxy.conf` (shared by every location, so
-a `certbot --nginx` rewrite can't drop it); don't hand-edit the site file — re-run the
-installer instead.
-
-On ngrok's free tier the URL changes per restart — use a static domain for anything
-persistent, and note the free tier's connection cap: a busy session (long-lived WS + 1s
-polls) can exceed it, which shows up as the live view freezing while pages still load.
-
-### Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| `/api/health` says `llm_configured: false` | the key isn't in `/etc/bandshell/bandshell.env` (a shell `export` or a repo `.env` has no effect on a systemd service). Add `OPENROUTER_API_KEY=…`, then `sudo systemctl restart bandshell` |
-| every page returns **401** | basic auth is on — that's the intended state; the browser prompts once and caches it |
-| I want to change the web password | `sudo bash deploy/install.sh --auth-pass 'new-one'` (a re-run *without* `--auth-pass` keeps the current password). Or directly: `sudo htpasswd /etc/nginx/bandshell.htpasswd youruser` — takes effect immediately, no reload |
-| a page is served but **200 without a prompt** | another nginx site is answering: `sudo nginx -T \| grep -nE 'listen\|server_name\|proxy_pass'` |
-| live view is blank, WS closes with 1006/404 | missing `Upgrade`/`Connection` headers (see snippet above), or the tunnel points at uvicorn |
-| scripted runs die with `exit 137` | sandbox `/proc` or memory limits; try `SANDBOX_CLIENT=mcp`, raise `SANDBOX_MAX_MEMORY_MB`, and check `[sandbox]` lines in `journalctl -u bandshell` |
-| the VM powered off by itself | that's `AUTO_SHUTDOWN_MINUTES` doing its job: `journalctl -u bandshell \| grep 'idle shutdown'` shows when and why. Set it to `0` to disable, or leave it and start the VM when you need it |
-| `apt-get update` fails: *repository '… trixie Release' does not have a Release file* | a previous run left a stale ngrok apt source. Re-running the installer repairs it (`trixie` → `bookworm`); to fix it by hand: `sudo sed -i 's/trixie/bookworm/' /etc/apt/sources.list.d/ngrok.list` |
-| the tunnel drops or won't start | `journalctl -u ngrok -n 40`. `ERR_NGROK_334` = that domain is claimed by another running agent; `ERR_NGROK_105` = bad authtoken |
-| the public URL shows ngrok's warning page (403) | free-plan browser interstitial — click through once in a browser; the app itself is unaffected |
-| idle shutdown never fires | in-flight work blocks it (check `busy` in `/api/activity`); press **Done** on a review page, or look for a sudoers error in the journal |
-## Repository layout
-
-| Path | Purpose |
-|------|---------|
-| `main.py` | FastAPI app, all `/api/*` routes, WebSocket live view |
-| `agents.py` | Agent orchestration state machines (`run_onboarding`, `run_task`) |
-| `bot.py` | LLM client (OpenRouter/OpenAI-compatible) with tool-call loop + retry/fallback handling |
-| `browser.py` | Playwright manager + the browser tools the agent calls |
-| `scripting.py` | Script validation (AST allowlist) and execution (`Driver`; runs in a bubblewrap sandbox when available) |
-| `sandbox_framing.py` `sandbox_host.py` `sandbox_runner.py` | Script sandbox: MCP-stdio framing, host-side driver server, sandbox-side runner |
-| `scripter.py` | Prompt builders + code-extraction helpers |
-| `event.py` `settings.py` `website.py` `task.py` | Dataclasses |
-| `eventbrite_api.py` | Eventbrite API client (drafts, image upload) |
-| `storage.py` `drive.py` `memory_storage.py` | Persistence facade (Google Sheets optional) |
-| `serialization.py` | Dataclass ↔ API-dict conversion, settings-version hashing |
-| `state.py` | Shared globals: LLM config, in-memory registries, sandbox/deploy settings |
-| `idle.py` | Idle-shutdown watchdog: activity tracking, `busy` guard, the shutdown command |
-| `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner: apt deps, `uv`, venv, Chromium, nginx site + auth + rate limit, systemd unit, env file, smoke checks |
-| `docs/sandbox-plan.md` | Sandbox design + threat model + what was verified |
-| `frontend/` | Static UI (`index.html`, `app.js`, `style.css`) + `user-guide.html`, a plain-English guide for end users (served at `/static/user-guide.html`) |
-| `logs/` | Runtime LLM usage + per-run transcripts (JSONL, gitignored) |
-| `tools/sandbox_smoke.py` | Smoke test for the bwrap + MCP-stdio sandbox bridge (no browser needed) |
-| `tools/idle_smoke.py` | Smoke test for the idle-shutdown watchdog (7 scenarios, no browser/network) |
-
-## Key behavior notes
-
-- **Scripts are gated by `validate_script()`** — an AST walk that rejects imports,
-  disallowed calls, and dangerous patterns before any script executes. This is the defense
-  against prompt/code injection (a malicious calendar site steering the agent toward
-  malicious code).
-- **Scripts then run inside a bubblewrap sandbox** (when `bwrap` is installed): no network,
-  no host filesystem (an empty tmpfs root plus a read-only whitelist of `/usr`, the venv and
-  three project files), no API keys in the environment, and CPU/memory/fd ceilings applied by
-  the runner itself (`resource.setrlimit`, soft == hard). The only thing the script can touch
-  is the 11 allowlisted `api.*` operations, which are served by the host over MCP-stdio and
-  drive the same review page you are watching. `SCRIPT_SANDBOX` controls it (`auto` = use
-  bwrap if it passes a one-time preflight, `0` = in-process fallback, `1` = require it).
-  See `docs/sandbox-plan.md`.
-- **Settings versioning:** generated scripts record a hash of the *global* settings they
-  were built against (venue, location, cost, categories, timezone, Eventbrite IDs). Changing
-  those marks a scripted website **stale** and it must be re-onboarded — scripts take those
-  defaults for granted. Per-event fields (website_url, organizer, contact info) don't
-  invalidate scripts; each event carries its own copy.
-- **Image URLs:** Google Drive share links are rewritten to direct-download URLs before the
-  agent or script uses them. A link that isn't shared ("Anyone with the link") is caught by a
-  preflight check and logs a clear warning instead of failing opaquely.
-- **The embedded view is a stream of JPEG frames** (rate = `BROWSER_FPS`, default 4fps
-  over a WebSocket), not a real iframe. With the default **chromium** engine it uses CDP
-  `Page.screencast` (a continuous optimized pipeline — the browser streams frames it's
-  already compositing; no per-frame re-capture), falling back to `page.screenshot()`
-  per-frame on Firefox. It's view-only while the AI works, interactive during
-  approval/review phases. Note: native browser popups (date pickers, select dropdowns)
-  are browser-chrome and don't appear in the captured stream — the UI hints you to type
-  or use the keyboard instead.
-  Because it's imagery, text in the page can't be copied from it — but you can paste *into*
-  it with Ctrl/Cmd+V (reads your OS clipboard, inserts into the focused field).
-- **The agent's browser window closes** when its interaction finishes; a website left
-  mid-onboarding by a crash/restart is reset to *Not set up* at startup rather than stuck
-  waiting to approve.
-
-## Monitoring
-
-- `logs/llm_usage.jsonl` — one line per LLM call: model, finish reason, token counts,
-  elapsed, failed attempts. Watch for `"finish": "length"` (the 8192-token runaway guard
-  cut a response short).
-- `logs/onboarding_*.jsonl` / `logs/task_*.jsonl` — full per-run transcripts (tool calls +
-  results included).
-
-Both files append forever and `generated/` grows by two dumps per codegen attempt — on a
-long-lived host, prune them (`find logs generated -type f -mtime +30 -delete`).
-
-For a deployed instance, `journalctl -u bandshell -f` shows the app's stdout/stderr,
-including the `[sandbox-runner]` / `[sandbox]` breadcrumbs, the `[idle]` shutdown
-decisions, and the `[browser-ws] ~X.Xfps` line that tells you whether the live view is
-actually producing frames.
-
-See `AGENTS.md` for the in-depth agent-oriented guide to the codebase.
+MIT — see [LICENSE](LICENSE).

@@ -17,3 +17,24 @@ wheels/
 
 # Scratch files (may contain secrets — e.g. test tokens)
 /misc/
+
+# Secrets: env files and service-account keys are downloaded, never committed.
+# (Files here may be named bandshell.env, *.env, or a Google key JSON.)
+*.env
+.env*
+!.env.example
+*service-account*.json
+*-key.json
+# Google console names keys "<project>-<12 hex>.json" — matches the downloaded file.
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
+key.json
+gcp-*.json
+*credentials*.json
+*.pem
+
+# Editors / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
