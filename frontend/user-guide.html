@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bandshell Calendar — A Plain-English Guide</title>
+<meta name="description" content="How to use Bandshell Calendar: create an event, set a website up once with the AI, then review and submit.">
+<style>
+  :root {
+    --ink: #1f2933;
+    --ink-soft: #52606d;
+    --line: #d9e2ec;
+    --bg: #f7f9fb;
+    --card: #ffffff;
+    --accent: #1f6feb;
+    --accent-soft: #eaf2ff;
+    --ok: #146c43;
+    --ok-soft: #e6f4ec;
+    --warn: #8a5300;
+    --warn-soft: #fdf3e2;
+    --stop: #a61b29;
+    --stop-soft: #fdecee;
+    --radius: 12px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  .wrap { max-width: 62rem; margin: 0 auto; padding: 0 1.25rem 6rem; }
+
+  /* ---------- header ---------- */
+  header.hero {
+    background: linear-gradient(160deg, #16324f 0%, #1f6feb 100%);
+    color: #fff;
+    padding: 3rem 0 2.5rem;
+    margin-bottom: 2rem;
+  }
+  header.hero .wrap { padding-bottom: 0; }
+  .eyebrow {
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    font-size: .72rem;
+    font-weight: 700;
+    opacity: .85;
+    margin: 0 0 .6rem;
+  }
+  h1 { font-size: clamp(1.7rem, 4.5vw, 2.6rem); line-height: 1.15; margin: 0 0 .8rem; }
+  .lede { font-size: 1.12rem; max-width: 42rem; margin: 0; color: #e8f0ff; }
+
+  .promise {
+    display: flex;
+    gap: .7rem;
+    align-items: flex-start;
+    background: rgba(255,255,255,.12);
+    border: 1px solid rgba(255,255,255,.25);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    margin-top: 1.6rem;
+    max-width: 46rem;
+    font-size: .97rem;
+  }
+  .promise b { white-space: nowrap; }
+
+  /* ---------- navigation ---------- */
+  nav.toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem;
+    margin: 0 0 2.5rem;
+  }
+  nav.toc a {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: .4rem .85rem;
+    font-size: .88rem;
+    color: var(--ink-soft);
+    text-decoration: none;
+  }
+  nav.toc a:hover, nav.toc a:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  /* ---------- sections ---------- */
+  section { margin-bottom: 3.25rem; scroll-margin-top: 1rem; }
+  h2 {
+    font-size: 1.45rem;
+    margin: 0 0 .35rem;
+    letter-spacing: -.01em;
+  }
+  h2 .num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.7rem; height: 1.7rem;
+    margin-right: .55rem;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: .95rem;
+    vertical-align: .12em;
+  }
+  h3 { font-size: 1.08rem; margin: 0 0 .3rem; }
+  p { margin: 0 0 .9rem; }
+  .sub { color: var(--ink-soft); margin-top: 0; }
+  a { color: var(--accent); }
+
+  /* ---------- cards ---------- */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 1rem;
+    margin: 1.2rem 0 0;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 1.1rem 1.2rem;
+  }
+  .card h3 { margin-top: .1rem; }
+  .card p:last-child { margin-bottom: 0; }
+  .badge-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem; height: 2rem;
+    border-radius: 8px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 700;
+    margin-bottom: .6rem;
+  }
+
+  /* ---------- steps ---------- */
+  .step {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 1.2rem 1.3rem;
+    margin-bottom: 1rem;
+    display: grid;
+    grid-template-columns: 2.4rem 1fr;
+    gap: 1rem;
+  }
+  .step .circle {
+    width: 2.4rem; height: 2.4rem;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 1.05rem;
+  }
+  .step.done .circle { background: var(--ok); }
+  .step h3 { font-size: 1.15rem; margin-bottom: .45rem; }
+  .step .time {
+    display: inline-block;
+    font-size: .8rem;
+    color: var(--ink-soft);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: .1rem .6rem;
+    margin-left: .4rem;
+    vertical-align: .1em;
+    white-space: nowrap;
+  }
+  .step ul { margin: .2rem 0 .6rem; padding-left: 1.15rem; }
+  .step li { margin-bottom: .3rem; }
+  .step > div > :last-child { margin-bottom: 0; }
+
+  /* ---------- callouts ---------- */
+  .note, .tip, .warn {
+    border-radius: 10px;
+    padding: .8rem 1rem;
+    margin: 1rem 0;
+    font-size: .96rem;
+    border: 1px solid transparent;
+  }
+  .note { background: var(--accent-soft); border-color: #c7dcff; }
+  .tip  { background: var(--ok-soft);    border-color: #c3e3d1; }
+  .warn { background: var(--warn-soft);  border-color: #f0d9b0; }
+  .note b.label, .tip b.label, .warn b.label {
+    display: block;
+    font-size: .74rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    margin-bottom: .25rem;
+  }
+  .note b.label { color: var(--accent); }
+  .tip  b.label { color: var(--ok); }
+  .warn b.label { color: var(--warn); }
+  .note p:last-child, .tip p:last-child, .warn p:last-child { margin-bottom: 0; }
+
+  /* ---------- tables ---------- */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+    font-size: .96rem;
+    margin: 1rem 0 0;
+  }
+  th, td { text-align: left; padding: .7rem .9rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--bg); font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-soft); }
+  tr:last-child td { border-bottom: 0; }
+
+  /* ---------- kbd / code ---------- */
+  kbd {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: .1rem .4rem;
+    font-size: .85em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  code {
+    background: #eef2f7;
+    border-radius: 4px;
+    padding: .1rem .35rem;
+    font-size: .88em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .ui {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: .05rem .4rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  /* ---------- FAQ ---------- */
+  details {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: .85rem 1rem;
+    margin-bottom: .6rem;
+  }
+  details[open] { border-color: #bfd4f7; }
+  summary {
+    cursor: pointer;
+    font-weight: 600;
+    list-style: none;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before {
+    content: "＋";
+    color: var(--accent);
+    font-weight: 700;
+    margin-right: .5rem;
+  }
+  details[open] summary::before { content: "−"; }
+  details > *:not(summary) { margin-top: .7rem; }
+  details p:last-child, details ul:last-child { margin-bottom: 0; }
+
+  ul.checks { list-style: none; padding: 0; margin: 1rem 0 0; }
+  ul.checks li {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: .65rem .9rem .65rem 2.4rem;
+    margin-bottom: .5rem;
+    position: relative;
+  }
+  ul.checks li::before {
+    content: "✓";
+    position: absolute;
+    left: .85rem;
+    color: var(--ok);
+    font-weight: 700;
+  }
+
+  footer {
+    border-top: 1px solid var(--line);
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    font-size: .9rem;
+    color: var(--ink-soft);
+  }
+
+  @media (max-width: 33rem) {
+    body { font-size: 16px; }
+    .step { grid-template-columns: 1fr; }
+    .step .circle { width: 2rem; height: 2rem; font-size: .95rem; }
+  }
+
+  @media print {
+    body { background: #fff; font-size: 11pt; }
+    header.hero { background: none; color: #000; padding: 0 0 1rem; }
+    .lede, .promise { color: #000; }
+    .promise { border-color: #999; background: none; }
+    nav.toc { display: none; }
+    .card, .step, details, table, ul.checks li { break-inside: avoid; }
+    a { color: #000; text-decoration: underline; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Bandshell Calendar · User guide</p>
+    <h1>Putting events on other people's calendars, without the copy-paste</h1>
+    <p class="lede">
+      This app teaches a small robot how to fill in one website's event form. You show it
+      once, you check its work, and after that it can do that website for you in a couple of
+      minutes per event.
+    </p>
+    <div class="promise">
+      <span aria-hidden="true">🛡️</span>
+      <span><b>Nothing is ever posted by itself.</b> The robot fills the form; <em>you</em>
+      look at it and press submit on the calendar site yourself.</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <nav class="toc" aria-label="Contents">
+    <a href="#idea">The big idea</a>
+    <a href="#before">Before you start</a>
+    <a href="#steps">The four steps</a>
+    <a href="#next-time">Next time</a>
+    <a href="#live-page">The live page</a>
+    <a href="#words">Words you'll see</a>
+    <a href="#help">When something's wrong</a>
+    <a href="#habits">Good habits</a>
+    <a href="#admin">For whoever runs the server</a>
+  </nav>
+
+  <!-- ================================================================ -->
+  <section id="idea">
+    <h2>The big idea</h2>
+    <p class="sub">Three things happen, in this order. Only the first one is slow.</p>
+
+    <div class="cards">
+      <div class="card">
+        <span class="badge-icon" aria-hidden="true">1</span>
+        <h3>You demonstrate (once per website)</h3>
+        <p>
+          Open a website and click <span class="ui">Set up this website</span>. An AI opens
+          the real form in a browser and starts filling it in. You watch, and step in when it
+          needs you (a login, a captcha, a field it got wrong).
+        </p>
+      </div>
+      <div class="card">
+        <span class="badge-icon" aria-hidden="true">2</span>
+        <h3>You approve</h3>
+        <p>
+          If the form looks right, click <span class="ui">Approve</span>. If not, click
+          <span class="ui">Reject</span> and say what's wrong — the AI tries again.
+        </p>
+      </div>
+      <div class="card">
+        <span class="badge-icon" aria-hidden="true">3</span>
+        <h3>You reuse it forever</h3>
+        <p>
+          The app writes down what worked as a <em>routine</em> for that website. Next time
+          you just pick an event, press run, check the filled form, and submit. No AI, no
+          waiting.
+        </p>
+      </div>
+    </div>
+
+    <div class="note">
+      <b class="label">Think of it like this</b>
+      <p>
+        You're not teaching the app what your events are — you already know that. You're
+        teaching it <em>where the boxes are</em> on one particular website. That knowledge is
+        what gets saved.
+      </p>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="before">
+    <h2>Before you start</h2>
+    <p class="sub">A five-minute check that saves an hour later.</p>
+
+    <ul class="checks">
+      <li><b>The link to the app</b> and a <b>username and password</b> from whoever set it up. Your browser will remember them after the first prompt.</li>
+      <li><b>The event details</b> you'd type by hand anyway: title, date and times, a short blurb and a longer description, ticket price, and a link to an image.</li>
+      <li><b>The calendar website's own login</b>, if it needs one. Sometimes you'll have to type it into the live page yourself — that's normal and expected.</li>
+      <li><b>An image link that anyone can open.</b> If you use Google Drive, right-click the file → <i>Share</i> → <i>Anyone with the link</i> → <i>Viewer</i>. Otherwise the calendar site will quietly reject it.</li>
+      <li><b>A modern browser</b> (Chrome, Edge, Firefox, Safari) and permission to leave the tab open while the AI works.</li>
+    </ul>
+
+    <div class="warn">
+      <b class="label">Don't do this on your phone</b>
+      <p>
+        The live page needs mouse clicks and a keyboard. A laptop or desktop is much easier.
+      </p>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="steps">
+    <h2>The four steps</h2>
+    <p class="sub">You do all of this in the app's own screens. Buttons are named exactly as they appear.</p>
+
+    <div class="step">
+      <div class="circle" aria-hidden="true">1</div>
+      <div>
+        <h3>Create the event <span class="time">2–3 minutes</span></h3>
+        <ul>
+          <li>Click <span class="ui">+ New Event</span>.</li>
+          <li>Fill in the title, dates and times, a short summary, a long description, and the image link.</li>
+          <li>Leave the contact fields and the website address blank unless this event is different from usual — blank means "use the defaults".</li>
+          <li>Click <span class="ui">Save</span>. The event now appears in the Events list.</li>
+        </ul>
+        <p>
+          The venue, cost, categories and timezone aren't asked here: they live in
+          <span class="ui">⚙️ Settings</span> because they're nearly always the same.
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="circle" aria-hidden="true">2</div>
+      <div>
+        <h3>Add the website <span class="time">1 minute</span></h3>
+        <ul>
+          <li>Switch to the <span class="ui">Websites</span> view and click <span class="ui">+ Website</span>.</li>
+          <li>Give it a name you'll recognise (e.g. "Downtown Arts Calendar") and paste the address of the page where events get submitted.</li>
+          <li>Click <span class="ui">Save</span>. The website shows a grey <b>Not set up</b> badge.</li>
+        </ul>
+        <p>You do this once per calendar website — not once per event.</p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="circle" aria-hidden="true">3</div>
+      <div>
+        <h3>Set the website up with the AI <span class="time">5–15 minutes, one time only</span></h3>
+        <p>This is the only part that needs your attention. Expect waiting, and expect to help.</p>
+        <ul>
+          <li>Open the website and click <span class="ui">Set up this website</span>, picking which event to use as the example.</li>
+          <li>Watch the <b>Live page</b> panel. The AI is driving a real browser: it clicks, types, opens menus.</li>
+          <li>If it asks for a login, or a captcha appears, or a date picker pops up — jump in. Click and type directly in the live page (details below).</li>
+          <li>When the form is filled correctly, click <span class="ui">Approve</span>.</li>
+          <li>If it's wrong, click <span class="ui">Reject</span> and write a short note ("the description goes in the second box", "wrong date format"). The AI reads it and tries again.</li>
+          <li>After you approve, the app writes the routine and runs it once so you can see it work. Approve that, and the website badge turns <b>Ready</b>.</li>
+        </ul>
+        <div class="tip">
+          <b class="label">Be specific when you reject</b>
+          <p>
+            "Wrong" and "try again" waste a round trip. "The price goes in the free-ticket box,
+            leave the paid box empty" gets it right the first time.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="step done">
+      <div class="circle" aria-hidden="true">4</div>
+      <div>
+        <h3>Review and submit <span class="time">2–4 minutes</span></h3>
+        <ul>
+          <li>Pick the event you want to publish to this website and press run.</li>
+          <li>The routine fills the real form. Read it in the live page — title, dates, description, image, price.</li>
+          <li>Fix anything by clicking into the field and typing.</li>
+          <li>Press the website's own <b>submit</b> button inside the live page. <em>You</em> post it, not the app.</li>
+          <li>Click <span class="ui">✓ Done</span> to close the page and finish.</li>
+        </ul>
+        <div class="warn">
+          <b class="label">The one rule</b>
+          <p>
+            Check before you submit. The app will happily fill a form with a typo you gave it.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="next-time">
+    <h2>Next time (the actual payoff)</h2>
+    <p class="sub">Roughly two minutes per event, per website, with no AI involved.</p>
+    <ol>
+      <li>Create the new event.</li>
+      <li>Open the website (badge <b>Ready</b>) and run it with that event.</li>
+      <li>Check the filled form in the live page, submit it, click <span class="ui">✓ Done</span>.</li>
+    </ol>
+    <p>
+      If a website's badge says <b>Needs attention</b> or <b>Stale</b>, something about the
+      site or the settings changed. Re-run the one-time setup for that website — it's
+      usually quicker the second time.
+    </p>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="live-page">
+    <h2>The live page, explained</h2>
+    <p class="sub">It looks like a website, but it's a live picture of a browser running on the server.</p>
+
+    <table>
+      <thead>
+        <tr><th>You'll see</th><th>What it means</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>A grey box saying "No live page right now"</td>
+          <td>Nothing is running yet. It appears once setup starts or a routine runs.</td>
+        </tr>
+        <tr>
+          <td>Hovering text like "It's your turn — click &amp; type"</td>
+          <td>The app has paused and is waiting for you. Your clicks and typing are sent to the real browser.</td>
+        </tr>
+        <tr>
+          <td>Frames that update slowly (a few per second)</td>
+          <td>Normal — it's a stream of pictures, not a video, to keep it light.</td>
+        </tr>
+        <tr>
+          <td>Scrolling works, but select/copy doesn't</td>
+          <td>By design: it's made of images, so there's no text to select.</td>
+        </tr>
+        <tr>
+          <td>A tip about using the keyboard instead</td>
+          <td>A date picker or dropdown is open. Those are drawn by the browser itself and can't be pictured — type the date and press <kbd>Enter</kbd>/<kbd>Tab</kbd> instead.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="tip">
+      <b class="label">Paste, the useful trick</b>
+      <p>
+        Copy text from anywhere, click the field in the live page, and press
+        <kbd>Ctrl</kbd>+<kbd>V</kbd> (<kbd>⌘</kbd>+<kbd>V</kbd> on a Mac). It's the fastest way
+        to drop a long description in.
+      </p>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="words">
+    <h2>Words you'll see in the app</h2>
+    <p class="sub">Nobody expects you to know these before you start.</p>
+
+    <table>
+      <thead>
+        <tr><th>Word</th><th>Plain meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><b>Website</b></td><td>One calendar you submit to. You add it once and reuse it.</td></tr>
+        <tr><td><b>Routine</b> / script</td><td>The saved recipe of clicks and typing for one website. Not something you edit by hand.</td></tr>
+        <tr><td><b>Set up</b> / onboarding</td><td>The one-time session where you and the AI fill the form together.</td></tr>
+        <tr><td><b>Approve</b> / <b>Reject</b></td><td>"That's right" / "not right, here's what to change".</td></tr>
+        <tr><td><b>Ready</b> (green)</td><td>The website is set up and can be used for any event.</td></tr>
+        <tr><td><b>Needs attention</b> (red)</td><td>Setup didn't finish. Open it and try again.</td></tr>
+        <tr><td><b>Stale</b> (amber)</td><td>Your default details changed (venue, cost, categories), so the saved routine may be out of date. Re-run setup.</td></tr>
+        <tr><td><b>Draft</b> (Eventbrite)</td><td>The event was created in Eventbrite but isn't public. You publish it there.</td></tr>
+        <tr><td><b>Settings</b></td><td>The details that are the same for nearly every event: venue, cost, categories, contact info.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="help">
+    <h2>When something looks wrong</h2>
+    <p class="sub">Click a question to open the answer.</p>
+
+    <details>
+      <summary>The live page is blank or frozen</summary>
+      <p>Give it a few seconds, then refresh the browser tab. The view reconnects on its own; a refresh is harmless — it doesn't stop the AI or lose the form.</p>
+    </details>
+
+    <details>
+      <summary>It keeps asking me to log in</summary>
+      <p>That's the app's own password (the browser should offer to remember it, and it usually does after the first time). If it's a <em>website</em> login that keeps coming back, the site may be signing the browser out — reject the attempt and mention it in the note; the AI can log in again during the next try.</p>
+    </details>
+
+    <details>
+      <summary>A badge says "Stale"</summary>
+      <p>The shared defaults (venue, location, cost, categories) changed after this website was set up, so the saved routine might not match the live form any more. Re-run the one-time setup for that website to refresh it.</p>
+    </details>
+
+    <details>
+      <summary>The setup failed, or the AI did something strange</summary>
+      <p>Click <b>Reject</b> and describe the problem in plain words. It retries with your note. If it fails the same way twice, it's usually the website (a new captcha, a changed layout) rather than you.</p>
+    </details>
+
+    <details>
+      <summary>I submitted the wrong thing</summary>
+      <p>Fix it on the calendar website itself — the app doesn't keep a copy of what was submitted, and it can't edit an entry for you. For Eventbrite, edit the draft before publishing.</p>
+    </details>
+
+    <details>
+      <summary>The whole app says "This server is shutting down"</summary>
+      <p>The server switches itself off after a long period of inactivity to save money. Nothing is lost — but you'll need whoever runs it to start it again, then reopen the link.</p>
+    </details>
+
+    <details>
+      <summary>Everything is greyed out</summary>
+      <p>The app only lets you click while it's your turn. Buttons that belong to a later step stay disabled until the current one finishes.</p>
+    </details>
+
+    <details>
+      <summary>I clicked "Done" and now I can't see the form</summary>
+      <p>Done closes the page — it means "I'm finished with this one". To see it again, run the routine for that event once more. Nothing was submitted twice.</p>
+    </details>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="habits">
+    <h2>Good habits</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>Keep the tab open</h3>
+        <p>During setup, closing the tab stops you watching — and you're the one who has to notice problems.</p>
+      </div>
+      <div class="card">
+        <h3>One event per run</h3>
+        <p>Routines fill one form for one event. Finish and click Done before starting the next.</p>
+      </div>
+      <div class="card">
+        <h3>Say what's wrong</h3>
+        <p>A short, specific note on a rejection is worth ten silent retries.</p>
+      </div>
+      <div class="card">
+        <h3>Trust your eyes</h3>
+        <p>The app has no idea whether your event description is good. That part is still you.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="admin">
+    <h2>For whoever runs the server</h2>
+    <p class="sub">Skip this unless you're the person maintaining the machine.</p>
+
+    <details>
+      <summary>The app is installed on a Debian/Ubuntu server</summary>
+      <p>
+        Everything is set up by <code>deploy/install.sh</code> (nginx with a login, the app
+        itself, and a startup service). To update after pulling new code, re-run it:
+      </p>
+      <p><code>sudo bash deploy/install.sh --auth-user you --nginx-port 8080</code></p>
+      <p>It's safe to re-run; it refreshes the code, the settings and the service.</p>
+    </details>
+
+    <details>
+      <summary>Checking that the app can see its keys</summary>
+      <p><code>curl -s http://127.0.0.1:8000/api/health</code> — shows booleans only (never secrets). Secrets live in <code>/etc/bandshell/bandshell.env</code>, one <code>KEY=VALUE</code> per line, and the service must be restarted after editing.</p>
+    </details>
+
+    <details>
+      <summary>It powers itself off when idle</summary>
+      <p>That's <code>AUTO_SHUTDOWN_MINUTES</code> (off by default). <code>AUTO_SHUTDOWN_DRY_RUN=1</code> logs the decision without switching off, and <code>curl -s http://127.0.0.1:8000/api/activity</code> shows how idle it is, whether work is in flight, and when it would stop. A stopped machine has to be started again from your cloud console.</p>
+    </details>
+
+    <details>
+      <summary>Where the logs are</summary>
+      <p><code>journalctl -u bandshell -f</code> for the app, and <code>logs/llm_usage.jsonl</code> in the project for one line per AI call.</p>
+    </details>
+  </section>
+
+  <footer>
+    <p>
+      A static page — no tracking, no scripts, safe to print or save. If something here
+      disagrees with what you see in the app, the app is right; tell whoever maintains it.
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>

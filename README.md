@@ -198,7 +198,7 @@ polls) can exceed it, which shows up as the live view freezing while pages still
 | `idle.py` | Idle-shutdown watchdog: activity tracking, `busy` guard, the shutdown command |
 | `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner: apt deps, `uv`, venv, Chromium, nginx site + auth + rate limit, systemd unit, env file, smoke checks |
 | `docs/sandbox-plan.md` | Sandbox design + threat model + what was verified |
-| `frontend/` | Static UI (`index.html`, `app.js`, `style.css`) |
+| `frontend/` | Static UI (`index.html`, `app.js`, `style.css`) + `user-guide.html`, a plain-English guide for end users (served at `/static/user-guide.html`) |
 | `logs/` | Runtime LLM usage + per-run transcripts (JSONL, gitignored) |
 | `tools/sandbox_smoke.py` | Smoke test for the bwrap + MCP-stdio sandbox bridge (no browser needed) |
 | `tools/idle_smoke.py` | Smoke test for the idle-shutdown watchdog (7 scenarios, no browser/network) |

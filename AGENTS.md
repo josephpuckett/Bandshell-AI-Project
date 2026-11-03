@@ -281,6 +281,13 @@ main.py       <- depends on everything; imports agents/serialization/state
   refresh the frontend re-renders lists + open detail panels.
 - **Help modal:** the `?` button opens a "How to use this app" dialog with the basic steps
   (create event → add website → one-time setup with AI + approve → review & submit).
+- **`frontend/user-guide.html`** — a long-form, plain-English guide for a non-technical
+  reader (what the app does, the four steps, how the live page behaves, a glossary, a
+  troubleshooting FAQ, and a collapsed section for whoever runs the server). It is a
+  **static, self-contained page**: no JS, no external fonts/CDNs, all CSS inline, so it also
+  works opened straight off disk and prints cleanly. Served at `/static/user-guide.html`
+  (thus behind nginx auth like everything else) and linked from the help modal. Keep it in
+  sync when the workflow or the button labels change — it names real buttons verbatim.
 - **Field tooltips:** a small **?** marker sits to the right of many field labels in the
   New Event, New Website, Settings, and Eventbrite-config dialogs. They show on hover only
   (no focus trigger — that caused them to auto-open when a dialog opened). Tip boxes are
