@@ -63,6 +63,7 @@ it does all of this, plus nginx, auth, and systemd.
 | `AUTO_SHUTDOWN_MAX_HOURS` | Escape hatch: power off after this much uptime even if work is in flight (`0` = never force) |
 | `AUTO_SHUTDOWN_DRY_RUN` | `1` logs the shutdown decision instead of powering off — watch the timer work |
 | `AUTO_SHUTDOWN_COMMAND` | What to run (default `sudo -n /usr/sbin/shutdown -h now`); the installer writes the matching sudoers rule |
+| `NGROK_URL` + `NGROK_AUTHTOKEN` | Read by `deploy/install.sh`, not the app: when both are set it installs ngrok and runs `ngrok http <nginx port> --url <NGROK_URL>` as `ngrok.service` |
 
 (The browser engine is set via the `BROWSER` env var, default `chromium`.)
 
@@ -77,6 +78,22 @@ loopback. Put secrets in `/etc/bandshell/bandshell.env`.
 sudo bash deploy/install.sh --auth-user you --nginx-port 8080
 ```
 
+**Hand it your secrets instead of typing them in.** Download the env file and the
+Google service-account key, then:
+
+```bash
+sudo bash deploy/install.sh --auth-user you --nginx-port 8080 \
+     --env-file ~/bandshell.env --google-key ~/sheets-key.json
+```
+
+`--env-file` installs that file as `/etc/bandshell/bandshell.env` (mode 600,
+previous one kept as `.bak`). It normalises what downloads usually bring — a UTF-8
+BOM and Windows/Drive CRLF line endings (a stray `\r` silently corrupts the last
+character of every value, e.g. your API key) — and reports lines that aren't
+`KEY=VALUE` instead of shipping a file systemd can't read. `--google-key` installs
+the service-account JSON at `/etc/bandshell/google-service-account.json` (mode 0640,
+readable by the app user) and points `GOOGLE_SERVICE_ACCOUNT_JSON` at it.
+
 **Environment variables go in `/etc/bandshell/bandshell.env`** (created by the
 installer, mode 600). It is read by the systemd unit — systemd does *not* inherit
 your shell, and a `.env` file in the repo is not read, because the app uses
@@ -87,6 +104,12 @@ OPENROUTER_API_KEY=sk-or-v1-...
 HEADLESS=1
 SCRIPT_SANDBOX=1
 ```
+
+Two things worth knowing about that file: **a plain re-run never changes an existing
+web password** (`--auth-pass 'new'` is how you rotate it), and **systemd's
+`EnvironmentFile` has no inline comments** — `AUTO_SHUTDOWN_MINUTES=30  # thirty`
+sets the value to `30  # thirty`. The installer warns about both, and the app logs
+`[config] ignoring invalid …` and falls back to the default rather than crash-loops.
 
 Then `sudo systemctl restart bandshell`. To check what the running process
 actually sees:
@@ -147,6 +170,27 @@ console, or a Cloud Scheduler job). The app's state survives if Google Sheets
 persistence is configured; otherwise in-memory state is lost with the power-off.
 
 
+### A public URL with ngrok
+
+Put `NGROK_URL` and `NGROK_AUTHTOKEN` in the env file (same file as everything
+else) and the installer does the rest — apt repo, authtoken, and a `ngrok.service`
+that starts *after* the app:
+
+```ini
+NGROK_URL=https://your-name.ngrok-free.app
+NGROK_AUTHTOKEN=2abc...            # ngrok dashboard → Your Authtoken
+```
+
+It runs `ngrok http 8080 --url <NGROK_URL>` against **nginx**, so the password and
+the WebSocket upgrade still apply; the final check probes the public URL and
+requires **401**. `--no-ngrok` skips it; `--ngrok-url`/`--ngrok-authtoken` override
+the file. Notes:
+
+- `--url` needs a **reserved** domain (free plans include one static domain).
+- If the tunnel won't stay up, `journalctl -u ngrok -n 40`: `ERR_NGROK_334` means
+  that domain is already claimed by another running agent.
+- Once ngrok is the front door, only **SSH** needs to be open in the cloud firewall.
+
 ### Serving externally
 
 The embedded live browser view uses a WebSocket (`/api/browser/{id}/ws`). The frontend
@@ -174,10 +218,13 @@ polls) can exceed it, which shows up as the live view freezing while pages still
 |---|---|
 | `/api/health` says `llm_configured: false` | the key isn't in `/etc/bandshell/bandshell.env` (a shell `export` or a repo `.env` has no effect on a systemd service). Add `OPENROUTER_API_KEY=…`, then `sudo systemctl restart bandshell` |
 | every page returns **401** | basic auth is on — that's the intended state; the browser prompts once and caches it |
+| I want to change the web password | `sudo bash deploy/install.sh --auth-pass 'new-one'` (a re-run *without* `--auth-pass` keeps the current password). Or directly: `sudo htpasswd /etc/nginx/bandshell.htpasswd youruser` — takes effect immediately, no reload |
 | a page is served but **200 without a prompt** | another nginx site is answering: `sudo nginx -T \| grep -nE 'listen\|server_name\|proxy_pass'` |
 | live view is blank, WS closes with 1006/404 | missing `Upgrade`/`Connection` headers (see snippet above), or the tunnel points at uvicorn |
 | scripted runs die with `exit 137` | sandbox `/proc` or memory limits; try `SANDBOX_CLIENT=mcp`, raise `SANDBOX_MAX_MEMORY_MB`, and check `[sandbox]` lines in `journalctl -u bandshell` |
 | the VM powered off by itself | that's `AUTO_SHUTDOWN_MINUTES` doing its job: `journalctl -u bandshell \| grep 'idle shutdown'` shows when and why. Set it to `0` to disable, or leave it and start the VM when you need it |
+| the tunnel drops or won't start | `journalctl -u ngrok -n 40`. `ERR_NGROK_334` = that domain is claimed by another running agent; `ERR_NGROK_105` = bad authtoken |
+| the public URL shows ngrok's warning page (403) | free-plan browser interstitial — click through once in a browser; the app itself is unaffected |
 | idle shutdown never fires | in-flight work blocks it (check `busy` in `/api/activity`); press **Done** on a review page, or look for a sudoers error in the journal |
 ## Repository layout
 

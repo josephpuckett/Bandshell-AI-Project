@@ -654,7 +654,31 @@
         itself, and a startup service). To update after pulling new code, re-run it:
       </p>
       <p><code>sudo bash deploy/install.sh --auth-user you --nginx-port 8080</code></p>
-      <p>It's safe to re-run; it refreshes the code, the settings and the service.</p>
+      <p>
+        To hand it your secrets instead of typing them in, download the env file and the
+        Google key first and add <code>--env-file ~/bandshell.env --google-key ~/key.json</code>.
+        It's safe to re-run; it refreshes the code, the settings and the service.
+      </p>
+    </details>
+
+    <details>
+      <summary>How do I change the app's password?</summary>
+      <p>
+        <code>sudo bash deploy/install.sh --auth-pass 'a-new-one'</code> — or directly
+        <code>sudo htpasswd /etc/nginx/bandshell.htpasswd youruser</code>, which takes effect
+        immediately. A plain re-run <i>never</i> changes an existing password.
+      </p>
+    </details>
+
+    <details>
+      <summary>The public address (ngrok)</summary>
+      <p>
+        If <code>NGROK_URL</code> and <code>NGROK_AUTHTOKEN</code> are set in the env file, a
+        tunnel runs as <code>ngrok.service</code> and forwards the public URL to nginx, so the
+        login still applies. Check it with <code>systemctl status ngrok</code>, watch it with
+        <code>journalctl -u ngrok -f</code>; the first visit in a browser may show ngrok's own
+        warning page once — click through it.
+      </p>
     </details>
 
     <details>

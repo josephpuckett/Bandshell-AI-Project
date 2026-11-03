@@ -17,7 +17,14 @@
 # It does NOT touch your environment/secrets. Provide them in:
 #     /etc/bandshell/bandshell.env      (KEY=VALUE lines, chmod 600)
 # which the systemd unit loads (OPENROUTER_API_KEY, EVENTBRITE_TOKEN,
-# GOOGLE_SERVICE_ACCOUNT_JSON, EVENTS_SPREADSHEET_ID, ...).
+# GOOGLE_SERVICE_ACCOUNT_JSON, EVENTS_SPREADSHEET_ID, NGROK_*, ...).
+# Pass a downloaded file with --env-file instead of hand-editing; Windows/Drive
+# line endings (CRLF) and a UTF-8 BOM are normalised, and invalid lines are
+# reported rather than silently breaking the service.
+#
+# Optional public URL: if the env file sets NGROK_URL + NGROK_AUTHTOKEN, this
+# installs ngrok, authenticates it and runs `ngrok http <nginx port> --url <URL>`
+# as a systemd unit (after the app). `--no-ngrok` skips it.
 #
 # Authentication: nginx HTTP Basic auth is ON by default (the app itself has no
 # login). Anyone with the URL could otherwise read your events, spend your
@@ -30,6 +37,8 @@
 #   sudo bash deploy/install.sh --nginx-port 80       # default is 8080
 #   sudo bash deploy/install.sh --port 9000           # uvicorn port
 #   sudo bash deploy/install.sh --domain events.example.org --email you@example.org
+#   sudo bash deploy/install.sh --env-file ~/bandshell.env   # secrets from a file
+#   sudo bash deploy/install.sh --google-key ~/sheets-key.json
 #   sudo bash deploy/install.sh --auto-shutdown 60    # power off after 60 min idle
 #   sudo bash deploy/install.sh --no-auth       # NOT recommended; warns loudly
 #   sudo bash deploy/install.sh --no-service --no-sandbox-test
@@ -59,6 +68,11 @@ RUN_SANDBOX_TEST="${RUN_SANDBOX_TEST:-1}"
 BROWSER_CHANNEL="chromium"
 AUTO_SHUTDOWN_MINUTES="${AUTO_SHUTDOWN_MINUTES:-0}"   # 0 = never (the app's default)
 AUTO_SHUTDOWN_MINUTES_EXPLICIT=0      # 1 when --auto-shutdown was passed
+ENV_FILE_SRC="${ENV_FILE_SRC:-}"      # --env-file: downloaded KEY=VALUE file to install
+GOOGLE_KEY_SRC="${GOOGLE_KEY_SRC:-}"  # --google-key: service-account JSON to install
+NGROK_ENABLED="${NGROK_ENABLED:-1}"   # 0 with --no-ngrok
+NGROK_AUTHTOKEN="${NGROK_AUTHTOKEN:-}"   # else read from $ENV_FILE
+NGROK_URL="${NGROK_URL:-}"               # else read from $ENV_FILE
 SUDO_SHUTDOWN=1                       # write the sudoers rule for idle shutdown
 
 # --------------------------------------------------------------------------- #
@@ -96,6 +110,11 @@ while [ $# -gt 0 ]; do
         --auth-pass)      AUTH_PASS="${2:?}"; AUTH_PASS_EXPLICIT=1; shift 2 ;;
         --no-auth)        AUTH_ENABLED=0; shift ;;
         --auto-shutdown)  AUTO_SHUTDOWN_MINUTES="${2:?}"; AUTO_SHUTDOWN_MINUTES_EXPLICIT=1; shift 2 ;;
+        --env-file)       ENV_FILE_SRC="${2:?}"; shift 2 ;;
+        --google-key)     GOOGLE_KEY_SRC="${2:?}"; shift 2 ;;
+        --ngrok-url)      NGROK_URL="${2:?}"; shift 2 ;;
+        --ngrok-authtoken) NGROK_AUTHTOKEN="${2:?}"; shift 2 ;;
+        --no-ngrok)       NGROK_ENABLED=0; shift ;;
         --no-shutdown-sudo) SUDO_SHUTDOWN=0; shift ;;
         --no-service)     INSTALL_SERVICE=0; shift ;;
         --no-sandbox-test) RUN_SANDBOX_TEST=0; shift ;;
@@ -145,6 +164,40 @@ LIMIT_ZONE="${SITE_NAME//-/_}_cost"
 PROXY_SNIPPET="/etc/nginx/snippets/${SITE_NAME}-proxy.conf"
 
 as_user() { sudo -u "$APP_USER" -H -- "$@"; }
+# Read a KEY's value out of the installed env file (used for NGROK_URL/TOKEN,
+# which live in the same file as everything else). Last occurrence wins, and
+# surrounding whitespace/quotes are stripped the way systemd would.
+env_value() {
+    awk -v k="$1" '
+        { line=$0; sub(/^[[:space:]]+/, "", line) }
+        line ~ ("^" k "=") {
+            v=line; sub(/^[^=]*=/, "", v)
+            sub(/[[:space:]]+$/, "", v)
+            gsub(/^"|"$/, "", v)
+            found=1
+        }
+        END { if (found) print v }
+    ' "$ENV_FILE" 2>/dev/null || true
+}
+
+# JSON check that survives a missing jq (step 1 installs jq, but don't let an
+# unrelated apt hiccup make a key-file install fail for the wrong reason).
+json_ok() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -e . "$1" >/dev/null 2>&1
+    else
+        "$APP_DIR/.venv/bin/python" -c 'import json,sys; json.load(open(sys.argv[1]))' \
+            "$1" >/dev/null 2>&1
+    fi
+}
+json_field() {  # file, dotted field name at the top level
+    if command -v jq >/dev/null 2>&1; then
+        jq -r ".$2 // \"?\"" "$1" 2>/dev/null
+    else
+        "$APP_DIR/.venv/bin/python" -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],"?") or "?")' \
+            "$1" "$2" 2>/dev/null || echo '?'
+    fi
+}
 
 # --------------------------------------------------------------------------- #
 # 1. Base packages
@@ -429,10 +482,57 @@ fi
 # --------------------------------------------------------------------------- #
 step "Environment file"
 install -d -m 0755 /etc/bandshell
-# Create the environment file rather than just nagging about it. systemd does
-# NOT inherit the shell you ran this script from, and the app reads os.getenv()
-# at import time — so this file is the ONLY place the service picks values up
-# from. (A .env file in the repo is not read.)
+# systemd does NOT inherit the shell you ran this script from, and the app reads
+# os.getenv() at import time — so this file is the ONLY place the service picks
+# values up from. (A .env file in the repo is not read.)
+
+# --- install a downloaded env file (--env-file) ----------------------------
+if [ -n "$ENV_FILE_SRC" ]; then
+    [ -r "$ENV_FILE_SRC" ] || die "cannot read --env-file $ENV_FILE_SRC"
+    tmp_env="$(mktemp)"
+    # Normalise what a download usually brings: a UTF-8 BOM and CRLF line endings.
+    # A stray \r silently becomes part of the last value (e.g. the API key), which
+    # fails much later with a confusing auth error — strip it here.
+    sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' "$ENV_FILE_SRC" >"$tmp_env"
+    # 'export FOO=bar' is shell syntax, not systemd syntax: warn on the ORIGINAL
+    # file (the filter below drops those lines, so checking afterwards is useless).
+    if grep -qE '^[[:space:]]*export[[:space:]]' "$tmp_env"; then
+        warn "$ENV_FILE_SRC contains 'export' lines — systemd takes the file literally,"
+        warn "  so they are dropped. Use plain KEY=VALUE (no export, no quotes)."
+    fi
+    # systemd's EnvironmentFile has NO inline comments: "X=30  # thirty" makes the
+    # value "30  # thirty" (which then fails numeric parsing or silently disables a
+    # feature). Point it out rather than guessing which part is the value.
+    inline_comments="$(grep -nE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^#]*[[:space:]]#' "$tmp_env" || true)"
+    if [ -n "$inline_comments" ]; then
+        warn "these lines have a trailing '# comment', which systemd keeps as part of the VALUE:"
+        printf '%s\n' "$inline_comments" | head -10 | sed 's/^/      /' >&2
+        warn "  EnvironmentFile has no inline comments — move the comment to its own line."
+    fi
+    if grep -qE "^[^#]*=[\"']" "$tmp_env"; then
+        warn "$ENV_FILE_SRC appears to quote a value; systemd keeps the quote characters."
+    fi
+    # Keep only blank/comment/KEY=VALUE lines; show anything else instead of
+    # installing a file that systemd would choke on.
+    bad_lines="$(grep -nvE '^[[:space:]]*(#|$)' "$tmp_env" \
+                 | grep -vE '^[0-9]+:[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' || true)"
+    if [ -n "$bad_lines" ]; then
+        warn "these lines in $ENV_FILE_SRC are not KEY=VALUE (skipped):"
+        printf '%s\n' "$bad_lines" | sed 's/^/      /' >&2
+        grep -E '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=|#|$)' "$tmp_env" >"$tmp_env.keep" || true
+        mv "$tmp_env.keep" "$tmp_env"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        cp -p "$ENV_FILE" "${ENV_FILE}.bak"
+        ok "existing env file backed up to ${ENV_FILE}.bak"
+    fi
+    install -m 0600 "$tmp_env" "$ENV_FILE"
+    rm -f "$tmp_env"
+    chown root:root "$ENV_FILE" 2>/dev/null || true
+    ok "installed secrets from $ENV_FILE_SRC ($(grep -cE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE") keys, mode 600)"
+fi
+
+# Create the environment file rather than just nagging about it, if it's absent.
 if [ ! -f "$ENV_FILE" ]; then
     cat >"$ENV_FILE" <<'ENVEOF'
 # Bandshell Calendar — read by the systemd unit (EnvironmentFile=).
@@ -454,6 +554,10 @@ if [ ! -f "$ENV_FILE" ]; then
 # BROWSER=chromium
 # BROWSER_FPS=4
 # BROWSER_JPEG_QUALITY=80
+#
+# Optional public URL (ngrok). Set BOTH to have the installer set up the tunnel:
+# NGROK_URL=https://your-name.ngrok-free.app     # a domain reserved in ngrok
+# NGROK_AUTHTOKEN=2abc...                        # ngrok dashboard → authtoken
 # (idle-shutdown keys are appended below, expanded with resolved paths)
 ENVEOF
     # Tolerate a non-root run (e.g. local testing); the mode is the important bit.
@@ -465,18 +569,23 @@ fi
 # Idle shutdown: append the keys with the resolved power-off path, so the env
 # file and the sudoers rule (5c) always agree. An existing value is kept.
 if ! grep -qE "^[[:space:]]*AUTO_SHUTDOWN_COMMAND=" "$ENV_FILE"; then
-    cat >>"$ENV_FILE" <<ENVEOF
-
-# Power the host off after nobody has used the app for a while (0 = disabled).
-# Fractions are allowed (0.5 = 30s) which makes the timer easy to test. The UI's
-# 1s polls do NOT count as activity, so a forgotten tab can't keep a VM billing.
-# Verify with AUTO_SHUTDOWN_DRY_RUN=1 (logs the decision, doesn't power off).
-AUTO_SHUTDOWN_MINUTES=$AUTO_SHUTDOWN_MINUTES
-# AUTO_SHUTDOWN_MAX_HOURS=0        # force off after N h uptime even if "busy"
-# AUTO_SHUTDOWN_DRY_RUN=1
-# AUTO_SHUTDOWN_CHECK_SECONDS=30
-AUTO_SHUTDOWN_COMMAND=sudo -n $SHUTDOWN_BIN -h now
-ENVEOF
+    {
+        printf '\n%s\n' "# Power the host off after nobody has used the app for a while (0 = disabled)."
+        printf '%s\n' "# Fractions are allowed (0.5 = 30s) which makes the timer easy to test. The UI's"
+        printf '%s\n' "# 1s polls do NOT count as activity, so a forgotten tab can't keep a VM billing."
+        printf '%s\n' "# Verify with AUTO_SHUTDOWN_DRY_RUN=1 (logs the decision, doesn't power off)."
+        # NEVER append a second AUTO_SHUTDOWN_MINUTES: systemd takes the LAST value,
+        # so a default here would silently override the downloaded file's setting.
+        if grep -qE "^[[:space:]]*AUTO_SHUTDOWN_MINUTES=" "$ENV_FILE"; then
+            printf '%s\n' "# (AUTO_SHUTDOWN_MINUTES is already set above — left as-is)"
+        else
+            printf 'AUTO_SHUTDOWN_MINUTES=%s\n' "$AUTO_SHUTDOWN_MINUTES"
+        fi
+        printf '%s\n' "# AUTO_SHUTDOWN_MAX_HOURS=0        # force off after N h uptime even if \"busy\""
+        printf '%s\n' "# AUTO_SHUTDOWN_DRY_RUN=1"
+        printf '%s\n' "# AUTO_SHUTDOWN_CHECK_SECONDS=30"
+        printf 'AUTO_SHUTDOWN_COMMAND=sudo -n %s -h now\n' "$SHUTDOWN_BIN"
+    } >>"$ENV_FILE"
 fi
 if [ "$AUTO_SHUTDOWN_MINUTES_EXPLICIT" = "1" ]; then
     # --auto-shutdown N: set the value (and un-comment it if it was disabled).
@@ -486,6 +595,66 @@ if [ "$AUTO_SHUTDOWN_MINUTES_EXPLICIT" = "1" ]; then
         printf 'AUTO_SHUTDOWN_MINUTES=%s\n' "$AUTO_SHUTDOWN_MINUTES" >>"$ENV_FILE"
     fi
     ok "idle shutdown: power off after ${AUTO_SHUTDOWN_MINUTES} min of inactivity"
+fi
+
+# --- Google service-account key (--google-key) -----------------------------
+GOOGLE_KEY_DEST="/etc/bandshell/google-service-account.json"
+if [ -n "$GOOGLE_KEY_SRC" ]; then
+    [ -r "$GOOGLE_KEY_SRC" ] || die "cannot read --google-key $GOOGLE_KEY_SRC"
+    install -m 0640 "$GOOGLE_KEY_SRC" "$GOOGLE_KEY_DEST"
+    # The app process (running as the app user) reads this at runtime, unlike the
+    # env file which only systemd/root reads — so group-read for the app's group.
+    chown root:"$(id -gn "$APP_USER")" "$GOOGLE_KEY_DEST" 2>/dev/null || true
+    chmod 0640 "$GOOGLE_KEY_DEST" 2>/dev/null || true
+    if json_ok "$GOOGLE_KEY_DEST"; then
+        ok "google key installed: $GOOGLE_KEY_DEST (0640, owner root:$(id -gn "$APP_USER"))"
+    else
+        rm -f "$GOOGLE_KEY_DEST"
+        die "$GOOGLE_KEY_SRC is not valid JSON — expected a service-account key file"
+    fi
+    ok "  client_email: $(json_field "$GOOGLE_KEY_DEST" client_email)"
+    if ! grep -qE '^[[:space:]]*GOOGLE_SERVICE_ACCOUNT_JSON=' "$ENV_FILE"; then
+        printf 'GOOGLE_SERVICE_ACCOUNT_JSON=%s\n' "$GOOGLE_KEY_DEST" >>"$ENV_FILE"
+        ok "  set GOOGLE_SERVICE_ACCOUNT_JSON to that path"
+    else
+        existing_key="$(env_value GOOGLE_SERVICE_ACCOUNT_JSON)"
+        if [ "$existing_key" != "$GOOGLE_KEY_DEST" ]; then
+            warn "the env file already sets GOOGLE_SERVICE_ACCOUNT_JSON to something else:"
+            warn "  $existing_key"
+            warn "  leaving it as-is; delete that line to use $GOOGLE_KEY_DEST instead."
+        fi
+    fi
+fi
+
+# Sanity-check the storage key that IS configured, so a broken path is caught now
+# instead of at the first save.
+gkey="$(env_value GOOGLE_SERVICE_ACCOUNT_JSON)"
+if [ -n "$gkey" ]; then
+    case "$gkey" in
+        /*)
+            if [ ! -r "$gkey" ]; then
+                warn "GOOGLE_SERVICE_ACCOUNT_JSON points at $gkey, which is not readable."
+                warn "  Google Sheets storage will stay disabled until that's fixed."
+            elif ! json_ok "$gkey"; then
+                warn "GOOGLE_SERVICE_ACCOUNT_JSON points at $gkey, which is not valid JSON."
+            fi ;;
+        \{*)
+            inline_tmp="$(mktemp)"
+            printf '%s' "$gkey" >"$inline_tmp"
+            if ! json_ok "$inline_tmp"; then
+                rm -f "$inline_tmp"
+                warn "GOOGLE_SERVICE_ACCOUNT_JSON looks like inline JSON but does not parse."
+                warn "  Inline JSON in an EnvironmentFile is fragile — prefer a file path."
+            fi
+            rm -f "$inline_tmp" ;;
+        *)
+            warn "GOOGLE_SERVICE_ACCOUNT_JSON is neither a path nor JSON — Sheets storage"
+            warn "  will stay disabled (use --google-key to install the file)." ;;
+    esac
+fi
+if [ -n "$(env_value EVENTS_SPREADSHEET_ID)" ] && [ -z "$gkey" ]; then
+    warn "EVENTS_SPREADSHEET_ID is set but GOOGLE_SERVICE_ACCOUNT_JSON is not —"
+    warn "  persistence needs both (pass --google-key with the key file)."
 fi
 
 # Did the caller export keys in their shell, expecting the service to see them?
@@ -589,10 +758,98 @@ UNIT
 fi
 
 # --------------------------------------------------------------------------- #
+# 6b. ngrok tunnel (optional — needs NGROK_URL + NGROK_AUTHTOKEN in the env file)
+# --------------------------------------------------------------------------- #
+NGROK_ACTIVE=0
+if [ "$NGROK_ENABLED" = "1" ]; then
+    # Both values live in the SAME env file as everything else; flags override.
+    [ -n "$NGROK_URL" ] || NGROK_URL="$(env_value NGROK_URL)"
+    [ -n "$NGROK_AUTHTOKEN" ] || NGROK_AUTHTOKEN="$(env_value NGROK_AUTHTOKEN)"
+    if [ -z "$NGROK_URL" ] && [ -z "$NGROK_AUTHTOKEN" ]; then
+        ok "ngrok: not configured (set NGROK_URL + NGROK_AUTHTOKEN in the env file)"
+    elif [ -z "$NGROK_URL" ] || [ -z "$NGROK_AUTHTOKEN" ]; then
+        die "ngrok needs BOTH NGROK_URL and NGROK_AUTHTOKEN (found only one)."
+    else
+        case "$NGROK_URL" in
+            https://*) ;;
+            *) die "NGROK_URL must be a full https:// address, e.g. https://you.ngrok-free.app" ;;
+        esac
+        step "ngrok tunnel"
+
+        # --- install the agent (Debian/Ubuntu apt repo) -------------------
+        if command -v ngrok >/dev/null 2>&1; then
+            ok "ngrok already installed ($(ngrok --version 2>/dev/null | head -1))"
+        else
+            ngrok_codename="$( (. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}") || true)"
+            if [ -z "$ngrok_codename" ]; then
+                warn "could not detect the distro codename — skipping the ngrok install."
+                warn "  install it by hand, then re-run with the env file set."
+            else
+                curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+                    | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+                echo "deb https://ngrok-agent.s3.amazonaws.com ${ngrok_codename} main" \
+                    >/etc/apt/sources.list.d/ngrok.list
+                # A codename without an ngrok repo makes `apt-get update` fail; don't
+                # let the tunnel take the whole install down with it.
+                if apt-get update -qq && apt-get install -y -qq ngrok >/dev/null; then
+                    ok "ngrok installed (repo: ${ngrok_codename})"
+                else
+                    warn "could not install ngrok from the ${ngrok_codename} repo — the app"
+                    warn "  is fine, the tunnel is skipped. Check /etc/apt/sources.list.d/ngrok.list"
+                fi
+            fi
+        fi
+
+        if command -v ngrok >/dev/null 2>&1; then
+            NGROK_BIN="$(command -v ngrok)"
+            # --- authenticate as the APP USER: the token is stored in that user's
+            #     ~/.config/ngrok/ngrok.yml, which is the account the unit runs as.
+            if as_user "$NGROK_BIN" config add-authtoken "$NGROK_AUTHTOKEN" >/dev/null 2>&1; then
+                ok "authtoken saved for $APP_USER (never echoed; not in the unit)"
+            else
+                warn "could not save the ngrok authtoken as $APP_USER"
+            fi
+
+            NGROK_UNIT="/etc/systemd/system/ngrok.service"
+            cat >"$NGROK_UNIT" <<NGROKUNIT
+[Unit]
+Description=ngrok tunnel to nginx (public URL for Bandshell Calendar)
+# After the app so the first request through the tunnel isn't a 502.
+After=network-online.target bandshell.service
+Wants=network-online.target bandshell.service
+
+[Service]
+Type=simple
+User=${APP_USER}
+# Tunnel to NGINX (auth + WebSocket upgrade live there) — never to uvicorn.
+ExecStart=${NGROK_BIN} http ${NGINX_PORT} --url ${NGROK_URL} --log stdout
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+NGROKUNIT
+            systemctl daemon-reload
+            systemctl enable ngrok.service >/dev/null 2>&1 || true
+            systemctl restart ngrok.service || true
+            ok "ngrok.service → http://127.0.0.1:${NGINX_PORT} at ${NGROK_URL}"
+            NGROK_ACTIVE=1
+        fi
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
 # 7. Smoke checks
 # --------------------------------------------------------------------------- #
 # Idle-shutdown status line for the summary (blank/0 == disabled).
 _idle_min="$(awk -F= '/^[[:space:]]*AUTO_SHUTDOWN_MINUTES=/{v=$2; gsub(/[[:space:]]/,"",v)} END{print v}' "$ENV_FILE" 2>/dev/null || true)"
+if [ "${NGROK_ACTIVE:-0}" = "1" ]; then
+    FIREWALL_HINT="  6. Firewall: only SSH needs to be open now — ngrok reaches nginx from
+     this machine's own loopback, so ${NGINX_PORT} can stay closed to the internet."
+else
+    FIREWALL_HINT="  6. Firewall: allow inbound ${NGINX_PORT} (and 443 if you add TLS), or keep it
+     closed and point a tunnel at it. Do NOT expose ${PORT}."
+fi
 if [ -n "${_idle_min:-}" ] && [ "$(awk -v v="$_idle_min" 'BEGIN{print (v+0>0)?1:0}')" = "1" ]; then
     IDLE_LINE="on — ${_idle_min} min"
 else
@@ -681,6 +938,31 @@ if [ "$INSTALL_SERVICE" = "1" ] && systemctl is-active --quiet bandshell; then
     fi
 fi
 
+# The tunnel is only useful if it fronts NGINX (auth intact). Probe the public URL.
+if [ "$NGROK_ACTIVE" = "1" ]; then
+    step "Public URL check"
+    pub_code="000"; pub_err=""
+    for _ in $(seq 1 15); do
+        pub_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "${NGROK_URL}/" 2>/dev/null || echo 000)"
+        [ "$pub_code" = "000" ] || break
+        sleep 2
+    done
+    case "$pub_code" in
+        401) ok "verified: ${NGROK_URL} reaches nginx and the login is enforced" ;;
+        200) warn "${NGROK_URL} answered WITHOUT a password (HTTP 200) — is the tunnel"
+             warn "  pointing at uvicorn (127.0.0.1:${PORT}) instead of nginx (:${NGINX_PORT})?"
+             VERIFY_FAILED=1 ;;
+        403) warn "${NGROK_URL} answered HTTP 403 — the tunnel is up but ngrok is"
+             warn "  refusing the request (free-plan browser interstitial, or the domain"
+             warn "  is claimed by another session: ERR_NGROK_334). Check: journalctl -u ngrok -n 40"
+             warn "  In a browser you may need to click through ngrok's warning page first." ;;
+        000) warn "${NGROK_URL} did not answer — DNS/domain not active yet, or the agent"
+             warn "  failed to start. Check: journalctl -u ngrok -n 40" ;;
+        *)   warn "${NGROK_URL} answered HTTP ${pub_code} (expected 401) — check:"
+             warn "  journalctl -u ngrok -n 40 ; curl -sI http://127.0.0.1:${NGINX_PORT}/" ;;
+    esac
+fi
+
 # --------------------------------------------------------------------------- #
 # Summary
 # --------------------------------------------------------------------------- #
@@ -719,6 +1001,24 @@ cat <<SUMMARY
 SUMMARY
 fi
 
+if [ "$NGROK_ACTIVE" = "1" ]; then
+cat <<SUMMARY
+  public URL   ${NGROK_URL}   (ngrok → nginx :${NGINX_PORT}, login required)
+  tunnel       systemctl {status|restart|stop} ngrok   ·  journalctl -u ngrok -f
+               Change the address or token: edit NGROK_URL / NGROK_AUTHTOKEN in
+               ${ENV_FILE} and re-run this script.
+SUMMARY
+elif [ "$NGROK_ENABLED" = "0" ]; then
+cat <<SUMMARY
+  public URL   not installed (--no-ngrok). Remove that flag, or expose ${NGINX_PORT} yourself.
+SUMMARY
+else
+cat <<SUMMARY
+  public URL   none configured — set NGROK_URL + NGROK_AUTHTOKEN in ${ENV_FILE}
+               (then re-run this script) or expose ${NGINX_PORT} yourself.
+SUMMARY
+fi
+
 cat <<SUMMARY
 
 Next steps:
@@ -727,11 +1027,12 @@ Next steps:
      shell export or a .env file in the repo has no effect on the service.
      Then: sudo systemctl restart bandshell
      Check what the process sees: curl -s http://127.0.0.1:${PORT}/api/health
-  2. Open port ${NGINX_PORT} (and 443 if you use TLS) in the cloud firewall — nginx is the
-     only public entry point; uvicorn itself listens on loopback only.
-     Point any tunnel (ngrok/cloudflared) at nginx (http://127.0.0.1:${NGINX_PORT}), NEVER
-     at 127.0.0.1:${PORT}: a tunnel straight to uvicorn skips nginx and the password.
-  2b. Rotate the password any time: sudo htpasswd ${HTPASSWD_FILE} ${AUTH_USER}
+  2. Network access — nginx is the only public entry point; uvicorn listens on
+     loopback only, so a tunnel must point at nginx (http://127.0.0.1:${NGINX_PORT}),
+     NEVER at 127.0.0.1:${PORT}: that would skip nginx and the password.
+  2b. Change the web password:  sudo bash deploy/install.sh --auth-pass 'new'
+      (a re-run without --auth-pass KEEPS the current password; several
+      --auth-user values can be added as extra logins: sudo htpasswd ${HTPASSWD_FILE} anotheruser)
   3. On a headless server keep HEADLESS=1 (already set in the unit).
   4. Script sandbox: install bubblewrap (done) and set SCRIPT_SANDBOX=1 so a broken
      sandbox fails loudly instead of silently running scripts unsandboxed.
@@ -740,6 +1041,7 @@ Next steps:
      Test it first with AUTO_SHUTDOWN_DRY_RUN=1, then check:
        curl -s http://127.0.0.1:${PORT}/api/activity
      A stopped instance must be started again (gcloud compute instances start …).
+${FIREWALL_HINT}
 SUMMARY
 
 if [ "$VERIFY_FAILED" = "1" ]; then

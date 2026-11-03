@@ -32,7 +32,7 @@ process memory (restart loses events, websites, scripts, settings).
 | `sandbox_runner.py` | Sandbox side: the only code executed inside bwrap. A `fastmcp.Client` over its **own** stdin/stdout (inverted stdio — it cannot spawn), fetches `get_job`, `exec`s the script in a scrubbed namespace, forwards each `api.*` as an MCP `tools/call`, reports the outcome, exits. **stdout is the wire** — script output is redirected to stderr. |
 | `tools/idle_smoke.py` | 7-scenario smoke test for the idle watchdog (no browser, no network; each scenario runs in its own subprocess because `idle.py` holds module-level state). |
 | `tools/sandbox_smoke.py` | VM smoke test for the sandbox bridge (bwrap flags, fd/pipe inheritance, framing both ways, event delivery, stdout hygiene, error propagation, runaway timeout). Uses a stub dispatcher, so it needs no browser. |
-| `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner for a real host: apt deps (incl. Chromium libs + bubblewrap), `uv` **as the app user**, `uv sync --frozen`, `playwright install chromium`, nginx site + snippet + basic auth + rate limit, systemd unit, `/etc/bandshell/bandshell.env`, then smoke checks (app imports, Chromium renders, sandbox smoke test, `/api/health`, auth probe must return 401). Re-runnable; aborts at the first failing step. |
+| `deploy/install.sh` | Idempotent Debian/Ubuntu provisioner for a real host: apt deps (incl. Chromium libs + bubblewrap), `uv` **as the app user**, `uv sync --frozen`, `playwright install chromium`, nginx site + snippet + basic auth + rate limit, systemd unit, env file (`--env-file`, BOM/CRLF-normalised), Google key (`--google-key`, 0640 root:appgroup), sudoers rule for idle shutdown, optional **ngrok** (apt repo + authtoken + `ngrok.service` after the app), then smoke checks (app imports, Chromium renders, sandbox smoke test, `/api/health`, auth probe must return 401, public-URL probe must return 401). Re-runnable; aborts at the first failing step. |
 | `docs/sandbox-plan.md` | Sandbox design + threat model + the bugs found during E2E verification. |
 | `scripter.py` | Prompt builders (`codegen_prompt`, `initial_*_message`) + code extraction helpers. |
 | `serialization.py` | Dataclass→API-dict serialization (`event_out`, `website_out`, ...) + `asset_url`, `current_settings_version`, `_parse_event_id`. |
@@ -67,6 +67,9 @@ process memory (restart loses events, websites, scripts, settings).
   rate-limited (429s in-band or as HTTP status are retried with `Retry-After` backoff).
 - Optional features (off by default, enabled by env vars):
   - **Eventbrite** websites: `EVENTBRITE_TOKEN`
+  - **Public URL (ngrok)**: `NGROK_URL` + `NGROK_AUTHTOKEN` in the env file — read by
+    `deploy/install.sh`, not by the app. Both or neither; a bad scheme or a lone value aborts
+    the install rather than half-configuring a tunnel.
   - **Google Sheets persistence**: `GOOGLE_SERVICE_ACCOUNT_JSON` (JSON content or path to the JSON file) + `EVENTS_SPREADSHEET_ID`
   - **Script sandbox**: `SCRIPT_SANDBOX=auto` (default — bwrap when installed, else in-process),
     `1`/`require` (fail the run if bwrap is missing), `0` (always in-process). Also
@@ -119,7 +122,22 @@ Facts that matter when touching either side:
 - **The systemd unit must not set `NoNewPrivileges`/`ProtectSystem`** — bwrap needs user
   namespaces. Uvicorn runs with `--workers 1` (all state is process-local) and
   `--timeout-graceful-shutdown 10` (so SIGTERM still flushes storage to Sheets).
-- **Env comes from `/etc/bandshell/bandshell.env`** — see Config & secrets.
+- **Env comes from `/etc/bandshell/bandshell.env`** — see Config & secrets. `--env-file`
+  installs a downloaded file (normalising BOM/CRLF, reporting non-`KEY=VALUE` lines, backing
+  up the old one to `.bak`); it never appends a second `AUTO_SHUTDOWN_MINUTES` because
+  systemd takes the **last** value (a default appended after the user's value silently wins).
+- **Password rotation is `--auth-pass`** — a re-run with a user that already exists replaces
+  that entry; a re-run *without* it keeps the existing password (so routine re-runs can't lock
+  people out). A different `--auth-user` adds a second account.
+- **`--google-key`**: the service-account JSON goes to `/etc/bandshell/google-service-account.json`
+  as `root:<app group>` **0640** — unlike the env file (root-only, read by systemd), this file
+  is read by the app process at runtime, so the app user must be able to read it.
+- **ngrok is optional and driven by the env file** (`NGROK_URL` + `NGROK_AUTHTOKEN`): the
+  installer adds the apt repo (codename from `/etc/os-release`, not hardcoded), saves the token
+  **as the app user** (its `~/.config/ngrok/ngrok.yml` — as root the service couldn't see it),
+  and writes `ngrok.service` running `ngrok http ${NGINX_PORT} --url $NGROK_URL --log stdout`
+  with `After=bandshell.service`. The tunnel must target **nginx**, and the probe requires a
+  401 through the public URL — a 200 means the tunnel bypasses auth.
 
 The manual equivalent of what the installer generates (abbreviated — the real file also
 has auth, the `map` for `Connection`, `proxy_buffering off`, and the rate limit):
