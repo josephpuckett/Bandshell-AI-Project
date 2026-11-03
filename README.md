@@ -230,6 +230,7 @@ polls) can exceed it, which shows up as the live view freezing while pages still
 | live view is blank, WS closes with 1006/404 | missing `Upgrade`/`Connection` headers (see snippet above), or the tunnel points at uvicorn |
 | scripted runs die with `exit 137` | sandbox `/proc` or memory limits; try `SANDBOX_CLIENT=mcp`, raise `SANDBOX_MAX_MEMORY_MB`, and check `[sandbox]` lines in `journalctl -u bandshell` |
 | the VM powered off by itself | that's `AUTO_SHUTDOWN_MINUTES` doing its job: `journalctl -u bandshell \| grep 'idle shutdown'` shows when and why. Set it to `0` to disable, or leave it and start the VM when you need it |
+| `apt-get update` fails: *repository '… trixie Release' does not have a Release file* | a previous run left a stale ngrok apt source. Re-running the installer repairs it (`trixie` → `bookworm`); to fix it by hand: `sudo sed -i 's/trixie/bookworm/' /etc/apt/sources.list.d/ngrok.list` |
 | the tunnel drops or won't start | `journalctl -u ngrok -n 40`. `ERR_NGROK_334` = that domain is claimed by another running agent; `ERR_NGROK_105` = bad authtoken |
 | the public URL shows ngrok's warning page (403) | free-plan browser interstitial — click through once in a browser; the app itself is unaffected |
 | idle shutdown never fires | in-flight work blocks it (check `busy` in `/api/activity`); press **Done** on a review page, or look for a sudoers error in the journal |

@@ -138,7 +138,10 @@ Facts that matter when touching either side:
   ("trixie") at a nonexistent `dists/trixie` and `apt-get update` fails (verified: HTTP 404).
   The agent is a static binary, so the bookworm package runs on newer releases; if apt can't
   serve it, `install_ngrok_tarball()` falls back to ngrok's official v3 stable tarball in
-  `/usr/local/bin`. It then saves the token
+  `/usr/local/bin`. **The source file is repaired before the first `apt-get update`** (a stale
+  `trixie` line poisons every update, which would abort the install in step 1 before the ngrok
+  section could rewrite it), and a failed update retries once with the ngrok source moved aside
+  instead of dying. It then saves the token
   **as the app user** (its `~/.config/ngrok/ngrok.yml` — as root the service couldn't see it),
   and writes `ngrok.service` running `ngrok http ${NGINX_PORT} --url $NGROK_URL --log stdout`
   with `After=bandshell.service`. The tunnel must target **nginx**, and the probe requires a

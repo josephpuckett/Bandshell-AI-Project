@@ -232,9 +232,26 @@ json_field() {  # file, dotted field name at the top level
 # --------------------------------------------------------------------------- #
 # 1. Base packages
 # --------------------------------------------------------------------------- #
+# A previous run may have left an ngrok apt source pointing at a suite that does
+# not exist (e.g. "trixie"). That poisons EVERY `apt-get update`, including the one
+# in this step — which would abort the install before the ngrok section below ever
+# gets a chance to rewrite the file. Repair it first.
+NGROK_SOURCES="/etc/apt/sources.list.d/ngrok.list"
+if [ -f "$NGROK_SOURCES" ] && ! grep -qE "^[[:space:]]*deb .*[[:space:]]${NGROK_REPO_SUITE}[[:space:]]" "$NGROK_SOURCES"; then
+    warn "stale ngrok apt source found ($(tr -d '\n' <"$NGROK_SOURCES"))"
+    warn "  rewriting it for the '${NGROK_REPO_SUITE}' suite"
+    printf 'deb https://ngrok-agent.s3.amazonaws.com %s main\n' "$NGROK_REPO_SUITE" >"$NGROK_SOURCES"
+fi
+
 step "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+if ! apt-get update -qq; then
+    # Don't let one broken third-party source take down the whole install: retry
+    # with the ngrok source out of the way (the tarball fallback covers ngrok).
+    warn "apt-get update failed — retrying with the ngrok source disabled"
+    mv -f "$NGROK_SOURCES" "${NGROK_SOURCES}.disabled" 2>/dev/null || true
+    apt-get update -qq || die "apt-get update failed twice — fix your apt sources (see /etc/apt/sources.list.d/) and re-run"
+fi
 apt-get install -y -qq \
     ca-certificates curl git jq unzip sudo \
     nginx bubblewrap procps \
@@ -815,7 +832,8 @@ if [ "$NGROK_ENABLED" = "1" ]; then
             # Fixed suite (see NGROK_REPO_SUITE): ngrok publishes bookworm/bullseye
             # only, so a Debian 13 "trixie" line here just 404s on apt-get update.
             echo "deb https://ngrok-agent.s3.amazonaws.com ${NGROK_REPO_SUITE} main" \
-                >/etc/apt/sources.list.d/ngrok.list
+                >"$NGROK_SOURCES"
+            rm -f "${NGROK_SOURCES}.disabled"
             if apt-get update -qq && apt-get install -y -qq ngrok >/dev/null; then
                 ok "ngrok installed (apt suite: ${NGROK_REPO_SUITE})"
             else
