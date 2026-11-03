@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bandshell Calendar — A Plain-English Guide</title>
+<title>Bandshell Calendar User Guide</title>
 <meta name="description" content="How to use Bandshell Calendar: create an event, set a website up once with the AI, then review and submit.">
 <style>
   :root {
@@ -319,15 +319,14 @@
 <header class="hero">
   <div class="wrap">
     <p class="eyebrow">Bandshell Calendar · User guide</p>
-    <h1>Putting events on other people's calendars, without the copy-paste</h1>
+    <h1>An automated way to fill in events for calendar sites</h1>
     <p class="lede">
-      This app teaches a small robot how to fill in one website's event form. You show it
-      once, you check its work, and after that it can do that website for you in a couple of
-      minutes per event.
+      This app teaches an AI agent how to fill in one website's event form. You show it once,
+      you check its work, and after that it can do that website for you in less than a minute per event.
     </p>
     <div class="promise">
       <span aria-hidden="true">🛡️</span>
-      <span><b>Nothing is ever posted by itself.</b> The robot fills the form; <em>you</em>
+      <span><b>Nothing is ever posted by itself.</b> The agent fills the form; <em>you</em>
       look at it and press submit on the calendar site yourself.</span>
     </div>
   </div>
@@ -355,11 +354,10 @@
     <div class="cards">
       <div class="card">
         <span class="badge-icon" aria-hidden="true">1</span>
-        <h3>You demonstrate (once per website)</h3>
+        <h3>The AI learns how to fill in the form (once per website)</h3>
         <p>
           Open a website and click <span class="ui">Set up this website</span>. An AI opens
-          the real form in a browser and starts filling it in. You watch, and step in when it
-          needs you (a login, a captcha, a field it got wrong).
+          the real form in a browser and starts filling it in.
         </p>
       </div>
       <div class="card">
@@ -380,28 +378,19 @@
         </p>
       </div>
     </div>
-
-    <div class="note">
-      <b class="label">Think of it like this</b>
-      <p>
-        You're not teaching the app what your events are — you already know that. You're
-        teaching it <em>where the boxes are</em> on one particular website. That knowledge is
-        what gets saved.
-      </p>
-    </div>
   </section>
 
   <!-- ================================================================ -->
   <section id="before">
     <h2>Before you start</h2>
-    <p class="sub">A five-minute check that saves an hour later.</p>
+    <p class="sub">Make sure you have:</p>
 
     <ul class="checks">
       <li><b>The link to the app</b> and a <b>username and password</b> from whoever set it up. Your browser will remember them after the first prompt.</li>
       <li><b>The event details</b> you'd type by hand anyway: title, date and times, a short blurb and a longer description, ticket price, and a link to an image.</li>
-      <li><b>The calendar website's own login</b>, if it needs one. Sometimes you'll have to type it into the live page yourself — that's normal and expected.</li>
+      <li><b>A calendar you can submit to without a login.</b> Currently, the app doesn't support calendars that require a login other than Eventbrite.</li>
       <li><b>An image link that anyone can open.</b> If you use Google Drive, right-click the file → <i>Share</i> → <i>Anyone with the link</i> → <i>Viewer</i>. Otherwise the calendar site will quietly reject it.</li>
-      <li><b>A modern browser</b> (Chrome, Edge, Firefox, Safari) and permission to leave the tab open while the AI works.</li>
+      <li><b>A modern browser</b> (Chrome, Edge, Firefox, Safari).</li>
     </ul>
 
     <div class="warn">
@@ -424,7 +413,7 @@
         <ul>
           <li>Click <span class="ui">+ New Event</span>.</li>
           <li>Fill in the title, dates and times, a short summary, a long description, and the image link.</li>
-          <li>Leave the contact fields and the website address blank unless this event is different from usual — blank means "use the defaults".</li>
+          <li>Don't change the organizer contact fields unless event is different from usual. They are already have their default values filled in.</li>
           <li>Click <span class="ui">Save</span>. The event now appears in the Events list.</li>
         </ul>
         <p>
@@ -440,7 +429,7 @@
         <h3>Add the website <span class="time">1 minute</span></h3>
         <ul>
           <li>Switch to the <span class="ui">Websites</span> view and click <span class="ui">+ Website</span>.</li>
-          <li>Give it a name you'll recognise (e.g. "Downtown Arts Calendar") and paste the address of the page where events get submitted.</li>
+          <li>Give it a name you'll recognise (e.g. "Long Beach Arts Calendar") and paste the address of the page where events get submitted.</li>
           <li>Click <span class="ui">Save</span>. The website shows a grey <b>Not set up</b> badge.</li>
         </ul>
         <p>You do this once per calendar website — not once per event.</p>
@@ -453,9 +442,8 @@
         <h3>Set the website up with the AI <span class="time">5–15 minutes, one time only</span></h3>
         <p>This is the only part that needs your attention. Expect waiting, and expect to help.</p>
         <ul>
-          <li>Open the website and click <span class="ui">Set up this website</span>, picking which event to use as the example.</li>
+          <li>Click the website and click <span class="ui">Set up this website</span>, picking which event to use as the example.</li>
           <li>Watch the <b>Live page</b> panel. The AI is driving a real browser: it clicks, types, opens menus.</li>
-          <li>If it asks for a login, or a captcha appears, or a date picker pops up — jump in. Click and type directly in the live page (details below).</li>
           <li>When the form is filled correctly, click <span class="ui">Approve</span>.</li>
           <li>If it's wrong, click <span class="ui">Reject</span> and write a short note ("the description goes in the second box", "wrong date format"). The AI reads it and tries again.</li>
           <li>After you approve, the app writes the routine and runs it once so you can see it work. Approve that, and the website badge turns <b>Ready</b>.</li>
@@ -502,8 +490,7 @@
     </ol>
     <p>
       If a website's badge says <b>Needs attention</b> or <b>Stale</b>, something about the
-      site or the settings changed. Re-run the one-time setup for that website — it's
-      usually quicker the second time.
+      site or the settings changed. Re-run the one-time setup for that website, and then run it with the event.
     </p>
   </section>
 
@@ -526,7 +513,7 @@
           <td>The app has paused and is waiting for you. Your clicks and typing are sent to the real browser.</td>
         </tr>
         <tr>
-          <td>Frames that update slowly (a few per second)</td>
+          <td>Frames that update slowly (several per second)</td>
           <td>Normal — it's a stream of pictures, not a video, to keep it light.</td>
         </tr>
         <tr>
@@ -535,7 +522,7 @@
         </tr>
         <tr>
           <td>A tip about using the keyboard instead</td>
-          <td>A date picker or dropdown is open. Those are drawn by the browser itself and can't be pictured — type the date and press <kbd>Enter</kbd>/<kbd>Tab</kbd> instead.</td>
+          <td>A date picker or dropdown is open. Sometimes, can't be displayed — type the date and press <kbd>Enter</kbd>/<kbd>Tab</kbd> instead.</td>
         </tr>
       </tbody>
     </table>
@@ -553,7 +540,7 @@
   <!-- ================================================================ -->
   <section id="words">
     <h2>Words you'll see in the app</h2>
-    <p class="sub">Nobody expects you to know these before you start.</p>
+    <p class="sub">Don't worry if you don't understand all of them when you start.</p>
 
     <table>
       <thead>
@@ -583,10 +570,10 @@
       <p>Give it a few seconds, then refresh the browser tab. The view reconnects on its own; a refresh is harmless — it doesn't stop the AI or lose the form.</p>
     </details>
 
-    <details>
+    <!--<details>
       <summary>It keeps asking me to log in</summary>
       <p>That's the app's own password (the browser should offer to remember it, and it usually does after the first time). If it's a <em>website</em> login that keeps coming back, the site may be signing the browser out — reject the attempt and mention it in the note; the AI can log in again during the next try.</p>
-    </details>
+    </details>-->
 
     <details>
       <summary>A badge says "Stale"</summary>
