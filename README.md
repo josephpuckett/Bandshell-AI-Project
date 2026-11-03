@@ -186,6 +186,13 @@ the WebSocket upgrade still apply; the final check probes the public URL and
 requires **401**. `--no-ngrok` skips it; `--ngrok-url`/`--ngrok-authtoken` override
 the file. Notes:
 
+The apt suite is **hardcoded to `bookworm`**, because that's what ngrok publishes
+(`bookworm`/`bullseye`; ask for `dists/trixie/Release` and you get a 404, which makes
+`apt-get update` fail on Debian 13). The agent is a static binary, so the bookworm
+package is fine on newer releases. If apt can't serve it at all, the installer falls
+back to ngrok's official static tarball in `/usr/local/bin`. Override with
+`--ngrok-repo-suite <suite>` if they ever publish more.
+
 - `--url` needs a **reserved** domain (free plans include one static domain).
 - If the tunnel won't stay up, `journalctl -u ngrok -n 40`: `ERR_NGROK_334` means
   that domain is already claimed by another running agent.

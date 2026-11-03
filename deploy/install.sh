@@ -25,6 +25,9 @@
 # Optional public URL: if the env file sets NGROK_URL + NGROK_AUTHTOKEN, this
 # installs ngrok, authenticates it and runs `ngrok http <nginx port> --url <URL>`
 # as a systemd unit (after the app). `--no-ngrok` skips it.
+# The apt repo suite is fixed at 'bookworm' (what ngrok publishes — Debian 13
+# "trixie" has no dist there), with --ngrok-repo-suite to override and a static
+# tarball fallback if apt can't serve the package.
 #
 # Authentication: nginx HTTP Basic auth is ON by default (the app itself has no
 # login). Anyone with the URL could otherwise read your events, spend your
@@ -73,6 +76,11 @@ GOOGLE_KEY_SRC="${GOOGLE_KEY_SRC:-}"  # --google-key: service-account JSON to in
 NGROK_ENABLED="${NGROK_ENABLED:-1}"   # 0 with --no-ngrok
 NGROK_AUTHTOKEN="${NGROK_AUTHTOKEN:-}"   # else read from $ENV_FILE
 NGROK_URL="${NGROK_URL:-}"               # else read from $ENV_FILE
+# ngrok's apt repo only publishes bookworm/bullseye (dists/trixie/Release → 404),
+# so the suite is HARDCODED — deriving it from /etc/os-release breaks on Debian 13.
+# The agent is a static binary, so a bookworm package is fine on newer releases.
+NGROK_REPO_SUITE="${NGROK_REPO_SUITE:-bookworm}"
+NGROK_BIN_DIR="${NGROK_BIN_DIR:-/usr/local/bin}"   # where the tarball fallback goes
 SUDO_SHUTDOWN=1                       # write the sudoers rule for idle shutdown
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +123,7 @@ while [ $# -gt 0 ]; do
         --ngrok-url)      NGROK_URL="${2:?}"; shift 2 ;;
         --ngrok-authtoken) NGROK_AUTHTOKEN="${2:?}"; shift 2 ;;
         --no-ngrok)       NGROK_ENABLED=0; shift ;;
+        --ngrok-repo-suite) NGROK_REPO_SUITE="${2:?}"; shift 2 ;;
         --no-shutdown-sudo) SUDO_SHUTDOWN=0; shift ;;
         --no-service)     INSTALL_SERVICE=0; shift ;;
         --no-sandbox-test) RUN_SANDBOX_TEST=0; shift ;;
@@ -178,6 +187,27 @@ env_value() {
         }
         END { if (found) print v }
     ' "$ENV_FILE" 2>/dev/null || true
+}
+
+# Fallback installer for the ngrok agent (official static build). Used when apt
+# can't serve a package — e.g. a distro whose codename ngrok hasn't published for.
+# NGROK_BIN_DIR exists so this is testable without touching /usr/local/bin.
+install_ngrok_tarball() {
+    ngrok_tmp="$(mktemp -d)"
+    if curl -sSL --max-time 300 -o "$ngrok_tmp/ngrok.tgz" \
+            "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz" \
+       && tar xzf "$ngrok_tmp/ngrok.tgz" -C "$ngrok_tmp" \
+       && install -d -m 0755 "$NGROK_BIN_DIR" \
+       && install -m 0755 "$ngrok_tmp/ngrok" "$NGROK_BIN_DIR/ngrok"; then
+        rm -rf "$ngrok_tmp"
+        ok "ngrok installed from the official tarball → $NGROK_BIN_DIR/ngrok ($("$NGROK_BIN_DIR/ngrok" --version 2>/dev/null | head -1))"
+        return 0
+    fi
+    rm -rf "$ngrok_tmp"
+    warn "could not install ngrok (apt suite '$NGROK_REPO_SUITE' unavailable and the"
+    warn "  tarball download failed). Install it by hand from https://ngrok.com/download"
+    warn "  and re-run this script."
+    return 1
 }
 
 # JSON check that survives a missing jq (step 1 installs jq, but don't let an
@@ -780,23 +810,18 @@ if [ "$NGROK_ENABLED" = "1" ]; then
         if command -v ngrok >/dev/null 2>&1; then
             ok "ngrok already installed ($(ngrok --version 2>/dev/null | head -1))"
         else
-            ngrok_codename="$( (. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}") || true)"
-            if [ -z "$ngrok_codename" ]; then
-                warn "could not detect the distro codename — skipping the ngrok install."
-                warn "  install it by hand, then re-run with the env file set."
+            curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+                | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+            # Fixed suite (see NGROK_REPO_SUITE): ngrok publishes bookworm/bullseye
+            # only, so a Debian 13 "trixie" line here just 404s on apt-get update.
+            echo "deb https://ngrok-agent.s3.amazonaws.com ${NGROK_REPO_SUITE} main" \
+                >/etc/apt/sources.list.d/ngrok.list
+            if apt-get update -qq && apt-get install -y -qq ngrok >/dev/null; then
+                ok "ngrok installed (apt suite: ${NGROK_REPO_SUITE})"
             else
-                curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
-                    | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-                echo "deb https://ngrok-agent.s3.amazonaws.com ${ngrok_codename} main" \
-                    >/etc/apt/sources.list.d/ngrok.list
-                # A codename without an ngrok repo makes `apt-get update` fail; don't
-                # let the tunnel take the whole install down with it.
-                if apt-get update -qq && apt-get install -y -qq ngrok >/dev/null; then
-                    ok "ngrok installed (repo: ${ngrok_codename})"
-                else
-                    warn "could not install ngrok from the ${ngrok_codename} repo — the app"
-                    warn "  is fine, the tunnel is skipped. Check /etc/apt/sources.list.d/ngrok.list"
-                fi
+                warn "apt could not install ngrok from the '${NGROK_REPO_SUITE}' suite —"
+                warn "  falling back to the official static binary."
+                install_ngrok_tarball || true
             fi
         fi
 

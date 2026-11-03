@@ -133,7 +133,12 @@ Facts that matter when touching either side:
   as `root:<app group>` **0640** — unlike the env file (root-only, read by systemd), this file
   is read by the app process at runtime, so the app user must be able to read it.
 - **ngrok is optional and driven by the env file** (`NGROK_URL` + `NGROK_AUTHTOKEN`): the
-  installer adds the apt repo (codename from `/etc/os-release`, not hardcoded), saves the token
+  installer adds the apt repo with the suite **hardcoded to `bookworm`** — ngrok only
+  publishes `bookworm`/`bullseye`, so deriving it from `/etc/os-release` sends Debian 13
+  ("trixie") at a nonexistent `dists/trixie` and `apt-get update` fails (verified: HTTP 404).
+  The agent is a static binary, so the bookworm package runs on newer releases; if apt can't
+  serve it, `install_ngrok_tarball()` falls back to ngrok's official v3 stable tarball in
+  `/usr/local/bin`. It then saves the token
   **as the app user** (its `~/.config/ngrok/ngrok.yml` — as root the service couldn't see it),
   and writes `ngrok.service` running `ngrok http ${NGINX_PORT} --url $NGROK_URL --log stdout`
   with `After=bandshell.service`. The tunnel must target **nginx**, and the probe requires a
